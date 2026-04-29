@@ -3,6 +3,14 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+logs/
+*.log
+*.log.*
+*.bak
+*.bak.*
+*.before-*
+__pycache__/
+*.py[cod]
 
 .env
 .env.local
@@ -11,10 +19,10 @@ pnpm-debug.log*
 
 coverage/
 dist/
-*.tgz
-*.tar.gz
 
 .DS_Store
 Thumbs.db
 /.idea/
 /sessions.json
+*.tgz
+*.tar.gz

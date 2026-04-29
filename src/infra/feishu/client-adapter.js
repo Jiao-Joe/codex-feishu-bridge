@@ -1,19 +1,58 @@
+const fs = require("fs");
+const path = require("path");
+
 // Feishu SDK adapter and compatibility helpers
 class FeishuClientAdapter {
   constructor(client) {
     this.client = client;
   }
 
-  async sendFileMessage({ chatId, fileName, fileBuffer, replyToMessageId = "", replyInThread = false }) {
+  async sendFileMessage({
+    chatId,
+    fileName,
+    fileBuffer,
+    fileType = "stream",
+    msgType = "file",
+    duration = null,
+    replyToMessageId = "",
+    replyInThread = false,
+  }) {
     const fileKey = await this.uploadFile({
       fileName,
       fileBuffer,
+      fileType,
+      duration,
     });
     if (!fileKey) {
       throw new Error("Feishu file upload did not return a file_key");
     }
 
     const content = JSON.stringify({ file_key: fileKey });
+    return this.sendResourceMessage({
+      chatId,
+      replyToMessageId,
+      replyInThread,
+      msgType,
+      content,
+    });
+  }
+
+  async sendImageMessage({ chatId, imageBuffer, replyToMessageId = "", replyInThread = false }) {
+    const imageKey = await this.uploadImage({ imageBuffer });
+    if (!imageKey) {
+      throw new Error("Feishu image upload did not return an image_key");
+    }
+
+    return this.sendResourceMessage({
+      chatId,
+      replyToMessageId,
+      replyInThread,
+      msgType: "image",
+      content: JSON.stringify({ image_key: imageKey }),
+    });
+  }
+
+  async sendResourceMessage({ chatId, replyToMessageId = "", replyInThread = false, msgType, content }) {
     if (replyToMessageId) {
       const replyMessage = resolveReplyMessageMethod(this.client);
       return replyMessage.call(this.client.im?.v1?.message || this.client.im?.message || this.client, {
@@ -21,7 +60,7 @@ class FeishuClientAdapter {
           message_id: normalizeMessageId(replyToMessageId),
         },
         data: {
-          msg_type: "file",
+          msg_type: msgType,
           content,
           reply_in_thread: replyInThread,
         },
@@ -35,7 +74,7 @@ class FeishuClientAdapter {
       },
       data: {
         receive_id: chatId,
-        msg_type: "file",
+        msg_type: msgType,
         content,
       },
     });
@@ -211,16 +250,66 @@ class FeishuClientAdapter {
     );
   }
 
-  async uploadFile({ fileName, fileBuffer }) {
+  async uploadFile({ fileName, fileBuffer, fileType = "stream", duration = null }) {
     const createFile = resolveCreateFileMethod(this.client);
+    const data = {
+      file_type: normalizeFeishuFileType(fileType),
+      file_name: normalizeFileName(fileName),
+      file: fileBuffer,
+    };
+    const normalizedDuration = Number(duration || 0);
+    if (Number.isFinite(normalizedDuration) && normalizedDuration > 0) {
+      data.duration = normalizedDuration;
+    }
     const response = await createFile.call(this.client.im?.v1?.file || this.client.im?.file || this.client, {
-      data: {
-        file_type: "stream",
-        file_name: normalizeFileName(fileName),
-        file: fileBuffer,
-      },
+      data,
     });
     return normalizeIdentifier(response?.file_key || response?.data?.file_key);
+  }
+
+  async uploadImage({ imageBuffer }) {
+    const createImage = resolveCreateImageMethod(this.client);
+    const response = await createImage.call(this.client.im?.v1?.image || this.client.im?.image || this.client, {
+      data: {
+        image_type: "message",
+        image: imageBuffer,
+      },
+    });
+    return normalizeIdentifier(response?.image_key || response?.data?.image_key);
+  }
+
+  async downloadMessageResource({ messageId, fileKey, type, filePath = "" }) {
+    const normalizedMessageId = normalizeMessageId(messageId);
+    const normalizedFileKey = normalizeIdentifier(fileKey);
+    const normalizedType = normalizeIdentifier(type);
+    if (!normalizedMessageId || !normalizedFileKey || !normalizedType) {
+      throw new Error("Feishu messageResource.get requires messageId, fileKey, and type");
+    }
+
+    const getResource = resolveGetMessageResourceMethod(this.client);
+    const response = await getResource.call(
+      this.client.im?.v1?.messageResource || this.client.im?.messageResource || this.client,
+      {
+        params: {
+          type: normalizedType,
+        },
+        path: {
+          message_id: normalizedMessageId,
+          file_key: normalizedFileKey,
+        },
+      }
+    );
+
+    if (filePath) {
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      await response.writeFile(filePath);
+    }
+
+    return {
+      filePath,
+      headers: response.headers || {},
+      getReadableStream: response.getReadableStream,
+    };
   }
 }
 
@@ -284,6 +373,22 @@ function resolveCreateFileMethod(client) {
   const fn = client?.im?.v1?.file?.create || client?.im?.file?.create;
   if (typeof fn !== "function") {
     throw new Error("Unsupported Feishu SDK shape: missing file.create");
+  }
+  return fn;
+}
+
+function resolveCreateImageMethod(client) {
+  const fn = client?.im?.v1?.image?.create || client?.im?.image?.create;
+  if (typeof fn !== "function") {
+    throw new Error("Unsupported Feishu SDK shape: missing image.create");
+  }
+  return fn;
+}
+
+function resolveGetMessageResourceMethod(client) {
+  const fn = client?.im?.v1?.messageResource?.get || client?.im?.messageResource?.get;
+  if (typeof fn !== "function") {
+    throw new Error("Unsupported Feishu SDK shape: missing messageResource.get");
   }
   return fn;
 }
@@ -352,6 +457,11 @@ function assertFeishuBusinessOk(response, apiName) {
 
 function normalizeFileName(fileName) {
   return typeof fileName === "string" && fileName.trim() ? fileName.trim() : "file";
+}
+
+function normalizeFeishuFileType(fileType) {
+  const normalized = normalizeIdentifier(fileType);
+  return normalized || "stream";
 }
 
 module.exports = {

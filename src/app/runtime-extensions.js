@@ -1,11 +1,9 @@
-const emptyCodexProfiles = Object.freeze({
-  displayNames: Object.freeze({}),
-  profiles: Object.freeze({}),
-  beforeSwitchCodexAppServerProfile: async () => {},
-  getProfileHelpLines: () => [],
-  getProfileNote: () => "",
-});
+const memoryBridgeRuntime = require("../private/extensions/memory-bridge/memory-bridge-service");
+const hubRuntime = require("../private/extensions/hub/hub-service");
+const codexProfileAdapter = require("../private/extensions/codex-profile-adapter");
 
 module.exports = {
-  codexProfiles: emptyCodexProfiles,
+  codexProfiles: codexProfileAdapter,
+  memoryBridge: memoryBridgeRuntime,
+  hub: hubRuntime,
 };

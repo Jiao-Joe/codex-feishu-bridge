@@ -1,9 +1,10 @@
 const messageNormalizers = require("../presentation/message/normalizers");
 const eventsRuntime = require("./codex-event-service");
+const attachmentRuntime = require("../domain/attachments/attachment-service");
 const { formatFailureText } = require("../shared/error-text");
 
 async function onFeishuTextEvent(runtime, event) {
-  const normalized = messageNormalizers.normalizeFeishuTextEvent(event, runtime.config);
+  let normalized = messageNormalizers.normalizeFeishuTextEvent(event, runtime.config);
   if (!normalized) {
     return;
   }
@@ -15,8 +16,8 @@ async function onFeishuTextEvent(runtime, event) {
     });
     return;
   }
-
-  if (await runtime.dispatchTextCommand(normalized)) {
+  const isAttachmentCommand = normalized.command === "image_message" || normalized.command === "attachment_message";
+  if (!isAttachmentCommand && await runtime.dispatchTextCommand(normalized)) {
     return;
   }
 
@@ -28,15 +29,39 @@ async function onFeishuTextEvent(runtime, event) {
     return;
   }
   const { bindingKey, workspaceRoot } = workspaceContext;
-  const { threadId } = await runtime.resolveWorkspaceThreadState({
+  const codexParams = runtime.getCodexParamsForWorkspace(bindingKey, workspaceRoot);
+  const isImageMessage = normalized.command === "image_message";
+  const isAttachmentMessage = isImageMessage || normalized.command === "attachment_message";
+  normalized = {
+    ...normalized,
+    codexModel: codexParams.model || runtime.config.defaultCodexModel || "",
+  };
+  if (isAttachmentMessage) {
+    normalized = await attachmentRuntime.prepareAttachmentMessage(runtime, normalized, {
+      workspaceRoot,
+      expectedKind: isImageMessage ? "image" : "",
+    });
+    if (!normalized) {
+      return;
+    }
+  }
+  let { threadId } = await runtime.resolveWorkspaceThreadState({
     bindingKey,
     workspaceRoot,
     normalized,
-    autoSelectThread: true,
+    autoSelectThread: !isImageMessage,
   });
+  if (isImageMessage) {
+    threadId = "";
+  }
 
   if (threadId && runtime.activeTurnIdByThreadId.has(threadId)) {
     if (runtime.pendingApprovalByThreadId.has(threadId)) {
+      const queued = runtime.enqueueThreadMessage(threadId, {
+        bindingKey,
+        workspaceRoot,
+        normalized,
+      });
       const prompted = await runtime.sendApprovalPrompt({
         threadId,
         normalized,
@@ -45,17 +70,21 @@ async function onFeishuTextEvent(runtime, event) {
       await runtime.sendInfoCardMessage({
         chatId: normalized.chatId,
         replyToMessageId: normalized.messageId,
-        text: prompted
-          ? "上一条还在等授权。我已经把授权卡重新发出来了；也可以直接发 `/codex approve` 或 `/codex reject`。"
-          : "上一条还在等授权。可以直接发 `/codex approve` 允许本次请求，或发 `/codex reject` 拒绝。",
+        text: buildQueuedApprovalText({ prompted, queued }),
         kind: "approval",
       });
       return;
     }
+    const queued = runtime.enqueueThreadMessage(threadId, {
+      bindingKey,
+      workspaceRoot,
+      normalized,
+    });
+    const interrupted = await interruptRunningTurnForGuidance(runtime, threadId);
     await runtime.sendInfoCardMessage({
       chatId: normalized.chatId,
       replyToMessageId: normalized.messageId,
-      text: "当前线程还有任务在运行。请先等待完成，或发送 `/codex stop` 中断后再发新消息。",
+      text: buildQueuedMessageText(queued, { interrupted }),
     });
     return;
   }
@@ -84,6 +113,66 @@ async function onFeishuTextEvent(runtime, event) {
     });
     throw error;
   }
+}
+
+async function interruptRunningTurnForGuidance(runtime, threadId) {
+  if (runtime.interruptingThreadIds.has(threadId)) {
+    return "already_interrupting";
+  }
+  const turnId = runtime.activeTurnIdByThreadId.get(threadId) || "";
+  if (!turnId) {
+    return "no_active_turn";
+  }
+  runtime.interruptingThreadIds.add(threadId);
+  try {
+    await runtime.codex.sendRequest("turn/interrupt", {
+      threadId,
+      turnId,
+    });
+    return "interrupted";
+  } catch (error) {
+    console.warn(`[codex-im] guidance interrupt failed thread=${threadId}: ${error.message}`);
+    runtime.interruptingThreadIds.delete(threadId);
+    return "failed";
+  }
+}
+
+function buildQueuedMessageText(queued, { interrupted = "" } = {}) {
+  if (!queued?.ok) {
+    if (queued?.reason === "full") {
+      return "当前线程还在运行，消息队列也满了。先等我处理完前面的，或发送 `/codex stop` 中断当前任务。";
+    }
+    return "当前线程还在运行，这条暂时没能进入队列。先等我处理完前面的，或发送 `/codex stop` 中断当前任务。";
+  }
+  if (interrupted === "interrupted" || interrupted === "already_interrupting") {
+    return [
+      "我收到你的补充了，正在暂停上一轮。",
+      "",
+      `这条已进入引导队列，位置：第 ${queued.position} 条。`,
+      "我会把运行期间收到的补充按顺序合并，再按新的任务边界继续回答。",
+    ].join("\n");
+  }
+  return [
+    "当前线程还在运行，我已经把这条消息排进队列。",
+    "",
+    `队列位置：第 ${queued.position} 条`,
+    "上一轮结束后我会按补充后的任务边界继续处理，不用重发。",
+    "如果要放弃当前任务，可以发送 `/codex stop`。",
+  ].join("\n");
+}
+
+function buildQueuedApprovalText({ prompted, queued }) {
+  const queueText = queued?.ok
+    ? [`我也把这条新消息排进队列了，位置：第 ${queued.position} 条。`, "授权处理完后会自动继续。"]
+    : ["这条新消息暂时没能进入队列。"];
+  return [
+    prompted
+      ? "上一条还在等授权。我已经把授权卡重新发出来了。"
+      : "上一条还在等授权。",
+    "可以直接发 `/codex approve` 或 `/codex reject`。",
+    "",
+    ...queueText,
+  ].join("\n");
 }
 
 function buildUnsupportedMessageText(messageType) {

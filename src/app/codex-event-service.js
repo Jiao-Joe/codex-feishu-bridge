@@ -1,5 +1,7 @@
 const codexMessageUtils = require("../infra/codex/message-utils");
 const { formatFailureText } = require("../shared/error-text");
+const attachmentDirectives = require("../domain/attachments/outbound-directive-service");
+const planRuntime = require("../domain/plan/plan-service");
 
 async function handleStopCommand(runtime, normalized) {
   const { bindingKey, workspaceRoot } = runtime.getBindingContext(normalized);
@@ -20,18 +22,24 @@ async function handleStopCommand(runtime, normalized) {
       threadId,
       turnId,
     });
+    runtime.interruptingThreadIds.delete(threadId);
+    const clearedCount = runtime.clearThreadMessageQueue(threadId);
     runtime.cleanupThreadRuntimeState(threadId);
     await runtime.sendInfoCardMessage({
       chatId: normalized.chatId,
       replyToMessageId: normalized.messageId,
-      text: "已发送停止请求，并已清理飞书端运行状态。可以继续发新消息。",
+      text: clearedCount
+        ? `已发送停止请求，并清理飞书端运行状态；队列里的 ${clearedCount} 条消息也已取消。可以继续发新消息。`
+        : "已发送停止请求，并已清理飞书端运行状态。可以继续发新消息。",
     });
   } catch (error) {
+    runtime.interruptingThreadIds.delete(threadId);
+    const clearedCount = runtime.clearThreadMessageQueue(threadId);
     runtime.cleanupThreadRuntimeState(threadId);
     await runtime.sendInfoCardMessage({
       chatId: normalized.chatId,
       replyToMessageId: normalized.messageId,
-      text: `${formatFailureText("停止请求未确认", error)}\n\n我已先清理飞书端运行状态，你可以继续发消息；如果终端侧仍在跑，建议稍后再发一次 /codex stop。`,
+      text: `${formatFailureText("停止请求未确认", error)}\n\n我已先清理飞书端运行状态${clearedCount ? `，并取消队列里的 ${clearedCount} 条消息` : ""}。你可以继续发消息；如果终端侧仍在跑，建议稍后再发一次 /codex stop。`,
     });
   }
 }
@@ -39,6 +47,9 @@ async function handleStopCommand(runtime, normalized) {
 function handleCodexMessage(runtime, message) {
   if (typeof message?.method === "string") {
     console.log(`[codex-im] codex event ${message.method}`);
+  }
+  if (message?.method === "error") {
+    console.error(`[codex-im] codex error detail: ${codexMessageUtils.extractCodexErrorText(message?.params || {}) || JSON.stringify(message?.params || {})}`);
   }
   codexMessageUtils.trackAssistantDeltaReceipt(runtime.assistantDeltaSeenByRunKey, message);
   trackLatestTokenUsage(runtime, message);
@@ -87,6 +98,10 @@ function handleCodexMessage(runtime, message) {
         console.error(`[codex-im] failed to clear pending reaction: ${error.message}`);
       });
       runtime.cleanupThreadRuntimeState(threadId);
+      runtime.interruptingThreadIds.delete(threadId);
+      runtime.drainNextThreadMessage(threadId).catch((error) => {
+        console.error(`[codex-im] failed to drain queued Feishu message: ${error.message}`);
+      });
     });
 }
 
@@ -262,14 +277,43 @@ function truncateInline(text, limit = 80) {
 
 async function deliverToFeishu(runtime, event) {
   if (event.type === "im.agent_reply") {
+    const shouldHandleDirectives = !event.payload.suppressStreamingDuplicate;
+    const planQuestionResult = shouldHandleDirectives
+      ? await planRuntime.handlePlanQuestionDirectives(runtime, {
+        threadId: event.payload.threadId,
+        turnId: event.payload.turnId,
+        chatId: event.payload.chatId,
+        text: event.payload.text,
+      })
+      : { text: event.payload.text };
+    const attachmentResult = shouldHandleDirectives
+      ? await attachmentDirectives.handleOutboundAttachmentDirectives(runtime, {
+        threadId: event.payload.threadId,
+        turnId: event.payload.turnId,
+        chatId: event.payload.chatId,
+        text: planQuestionResult.text,
+      })
+      : { text: planQuestionResult.text, sent: 0 };
+    if (!attachmentResult.text && attachmentResult.sent > 0) {
+      return;
+    }
     await runtime.upsertAssistantReplyCard({
       threadId: event.payload.threadId,
       turnId: event.payload.turnId,
       chatId: event.payload.chatId,
-      text: event.payload.text,
+      text: attachmentResult.text,
+      mode: event.payload.mode || "delta",
       state: "streaming",
       deferFlush: !runtime.config.feishuStreamingOutput,
     });
+    if (shouldHandleDirectives) {
+      await planRuntime.maybeSendPlanConfirmationCard(runtime, {
+        threadId: event.payload.threadId,
+        turnId: event.payload.turnId,
+        chatId: event.payload.chatId,
+        text: attachmentResult.text,
+      });
+    }
     return;
   }
 
@@ -301,6 +345,14 @@ async function deliverToFeishu(runtime, event) {
         chatId: event.payload.chatId,
         text: event.payload.text || "执行失败",
         state: "failed",
+      });
+    } else if (event.payload.state === "retrying") {
+      await runtime.upsertAssistantReplyCard({
+        threadId: event.payload.threadId,
+        turnId: event.payload.turnId,
+        chatId: event.payload.chatId,
+        statusText: event.payload.text || "模型通道重连中，正在等待 Codex 自动恢复。",
+        state: "retrying",
       });
     }
     return;

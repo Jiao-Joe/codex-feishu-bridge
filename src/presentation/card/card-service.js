@@ -2,8 +2,10 @@ const codexMessageUtils = require("../../infra/codex/message-utils");
 const messageNormalizers = require("../message/normalizers");
 const reactionRepo = require("../../infra/feishu/reaction-repo");
 const {
+  buildCardKitAssistantElements,
   formatCardKitAssistantMarkdown,
   sanitizeAssistantMarkdown,
+  splitAssistantReplyForDisplay,
 } = require("../../shared/assistant-markdown");
 const { formatFailureText } = require("../../shared/error-text");
 const {
@@ -147,14 +149,15 @@ function formatCardActionFailureText(error) {
     return [
       "需要 macOS 完整磁盘访问权限。",
       "",
-      "Codex Feishu bridge 需要读取本地项目文件，但被系统拦住了：",
+      "Feishu 桥想读取 Jiao Knowledge Wiki，但被系统拦住了：",
       `\`${error.message}\``,
       "",
       "请在“系统设置 -> 隐私与安全性 -> 完整磁盘访问权限”里允许：",
       "- `/opt/homebrew/bin/node`",
       `- \`${nodePath}\``,
       "",
-      "授权后重启 codex-im 进程。",
+      "授权后在 Mac 上重启 Feishu 桥：",
+      "`launchctl kickstart -k gui/$(id -u)/com.yuan.feishu-bridge`",
     ].join("\n");
   }
   return formatFailureText("处理失败", error);
@@ -190,7 +193,7 @@ async function sendCardActionFeedback(runtime, data, text, kind = "info") {
 
 async function upsertAssistantReplyCard(
   runtime,
-  { threadId, turnId, chatId, text, state, deferFlush = false }
+  { threadId, turnId, chatId, text, statusText, state, mode = "delta", deferFlush = false }
 ) {
   if (!threadId || !chatId) {
     return;
@@ -225,6 +228,9 @@ async function upsertAssistantReplyCard(
       chatId,
       replyToMessageId: "",
       text: "",
+      answerText: "",
+      processText: "",
+      streamPhase: "process",
       state: "streaming",
       threadId,
       turnId: resolvedTurnId,
@@ -233,12 +239,16 @@ async function upsertAssistantReplyCard(
       cardKitSequence: 0,
       cardKitLastStreamedText: "",
       cardKitLastStatusSignature: "",
+      statusText: "",
       fallbackUsed: false,
     };
   }
 
   if (typeof text === "string" && text.length > 0) {
-    existing.text = mergeReplyText(existing.text, text);
+    applyAssistantReplyText(existing, text, mode);
+  }
+  if (typeof statusText === "string") {
+    existing.statusText = statusText.trim();
   }
   existing.chatId = chatId;
   existing.replyToMessageId = runtime.pendingChatContextByThreadId.get(threadId)?.messageId || existing.replyToMessageId || "";
@@ -250,6 +260,9 @@ async function upsertAssistantReplyCard(
     if (!(currentIsTerminal && !nextIsTerminal)) {
       existing.state = nextState;
     }
+  }
+  if (existing.state === "completed" || existing.state === "failed") {
+    existing.statusText = "";
   }
   if (resolvedTurnId) {
     existing.turnId = resolvedTurnId;
@@ -264,8 +277,121 @@ async function upsertAssistantReplyCard(
 
   const shouldFlushImmediately = existing.state === "completed"
     || existing.state === "failed"
-    || (!existing.messageId && typeof existing.text === "string" && existing.text.trim());
+    || existing.state === "retrying"
+    || (!existing.messageId && hasVisibleReplyCardContent(existing));
   await scheduleReplyCardFlush(runtime, runKey, { immediate: shouldFlushImmediately });
+}
+
+function hasVisibleReplyCardContent(entry) {
+  return Boolean(
+    String(entry?.text || "").trim()
+    || String(entry?.answerText || "").trim()
+    || String(entry?.processText || "").trim()
+  );
+}
+
+function applyAssistantReplyText(entry, text, mode = "delta") {
+  const incoming = typeof text === "string" ? text : "";
+  if (!incoming) {
+    return;
+  }
+  if (mode === "completed_snapshot") {
+    applyCompletedAssistantSnapshot(entry, incoming);
+    return;
+  }
+  applyStreamingAssistantDelta(entry, incoming);
+}
+
+function applyStreamingAssistantDelta(entry, incoming) {
+  if (entry.streamPhase === "answer") {
+    entry.answerText = mergeReplyText(entry.answerText || "", incoming);
+    entry.text = entry.answerText;
+    return;
+  }
+
+  const existingProcess = String(entry.processText || "").trim();
+  if (!existingProcess && looksLikeFinalAnswerStart(incoming)) {
+    entry.streamPhase = "answer";
+    entry.answerText = mergeReplyText(entry.answerText || "", incoming);
+    entry.text = entry.answerText;
+    return;
+  }
+
+  const combinedProcess = mergeReplyText(existingProcess, incoming);
+  const split = splitAssistantReplyForDisplay(combinedProcess);
+  if (split.preAnswerText && split.answerText) {
+    entry.streamPhase = "answer";
+    entry.processText = mergeProcessText(entry.processText, split.preAnswerText);
+    entry.answerText = mergeReplyText(entry.answerText || "", split.answerText);
+    entry.text = entry.answerText;
+    return;
+  }
+
+  entry.streamPhase = "process";
+  entry.processText = combinedProcess;
+  entry.text = entry.answerText || "";
+}
+
+function applyCompletedAssistantSnapshot(entry, text) {
+  const completedText = sanitizeAssistantMarkdown(text, { preserveHeadings: true });
+  if (!completedText) {
+    return;
+  }
+
+  const accumulated = sanitizeAssistantMarkdown(entry.answerText || entry.text || "", { preserveHeadings: true });
+  const processPrefix = extractProcessPrefixFromCompletedSnapshot(accumulated, completedText);
+  if (processPrefix) {
+    entry.processText = mergeProcessText(entry.processText, processPrefix);
+  }
+
+  entry.answerText = completedText;
+  entry.text = completedText;
+  entry.streamPhase = "answer";
+}
+
+function looksLikeFinalAnswerStart(text) {
+  const clean = String(text || "").replace(/^\s+/, "");
+  return /^(?:Jiao[，,]\s*(?:弄好了|好了|搞定了|处理好了|刚才|确实|文档|我把|我已|我已经|这次|现在)|(?:可以实现|能实现|答案是|结论是|我的判断是|先说结论)[，,。；;\s])/i.test(clean);
+}
+
+function extractProcessPrefixFromCompletedSnapshot(accumulated, completedText) {
+  const normalizedAccumulated = String(accumulated || "").trim();
+  const normalizedCompleted = String(completedText || "").trim();
+  if (!normalizedAccumulated || !normalizedCompleted || normalizedAccumulated === normalizedCompleted) {
+    return "";
+  }
+  if (normalizedAccumulated.endsWith(normalizedCompleted)) {
+    return normalizedAccumulated.slice(0, normalizedAccumulated.length - normalizedCompleted.length).trim();
+  }
+  const markerIndex = normalizedAccumulated.lastIndexOf(normalizedCompleted);
+  if (markerIndex > 0) {
+    return normalizedAccumulated.slice(0, markerIndex).trim();
+  }
+  if (
+    normalizedCompleted.startsWith(normalizedAccumulated)
+    || normalizedCompleted.includes(normalizedAccumulated)
+  ) {
+    return "";
+  }
+  return normalizedAccumulated;
+}
+
+function mergeProcessText(current, incoming) {
+  const left = String(current || "").trim();
+  const right = String(incoming || "").trim();
+  if (!right) {
+    return left;
+  }
+  if (!left) {
+    return right;
+  }
+  if (left.includes(right)) {
+    return left;
+  }
+  if (right.includes(left)) {
+    return right;
+  }
+  return `${left}\n\n${right}`.trim();
 }
 
 async function scheduleReplyCardFlush(runtime, runKey, { immediate = false } = {}) {
@@ -444,18 +570,12 @@ function buildCardKitStreamingCard(runtime, runKey, entry, options = {}) {
 
 function buildCardKitFinalCard(runtime, entry) {
   const runKey = codexMessageUtils.buildRunKey(entry.threadId, entry.turnId);
-  const content = buildCardKitStreamingContent(entry);
+  const display = buildAssistantDisplayContent(entry);
+  const content = display.answer;
   const footer = buildCardKitFooter(runtime, entry);
   const elements = [
     ...buildCardKitStatusPanels(runtime, runKey, entry),
-    {
-      tag: "markdown",
-      content,
-      text_align: "left",
-      text_size: "normal_v2",
-      margin: "0px 0px 0px 0px",
-      element_id: CARDKIT_STREAMING_ELEMENT_ID,
-    },
+    ...buildCardKitAssistantElements(content, { elementId: CARDKIT_STREAMING_ELEMENT_ID }),
   ];
 
   if (footer) {
@@ -484,27 +604,31 @@ function buildCardKitStatusPanels(runtime, runKey, entry) {
   const toolTrace = runtime.toolTraceByRunKey.get(runKey);
   const elapsed = formatReplyElapsed(entry.startedAt);
   const tokenUsage = runtime.latestTokenUsageByThreadId.get(entry.threadId);
+  const display = buildAssistantDisplayContent(entry);
   return [
     buildCardKitCollapsiblePanel({
-      title: buildToolPanelTitle(runtime.toolItemIdsByRunKey.get(runKey), entry.state),
-      content: formatToolTraceText(toolTrace, entry.state),
-    }),
-    buildCardKitCollapsiblePanel({
-      title: entry.state === "streaming" ? "💭 正在想" : "💭 思考完成",
-      content: formatThinkingText({
+      title: buildProcessPanelTitle({
+        state: entry.state,
+        elapsed,
+      }),
+      expanded: entry.state !== "completed" && entry.state !== "failed",
+      content: formatProcessTimelineText({
         state: entry.state,
         elapsed,
         toolTrace,
         tokenUsage,
+        statusText: entry.statusText,
+        assistantNotes: display.notes,
+        memoryTrace: runtime.memoryPreflightByThreadId?.get(entry.threadId),
       }),
     }),
   ];
 }
 
-function buildCardKitCollapsiblePanel({ title, content }) {
+function buildCardKitCollapsiblePanel({ title, content, expanded = false }) {
   return {
     tag: "collapsible_panel",
-    expanded: false,
+    expanded: expanded === true,
     header: {
       title: {
         tag: "plain_text",
@@ -530,34 +654,42 @@ function buildCardKitCollapsiblePanel({ title, content }) {
   };
 }
 
-function buildToolPanelTitle(toolItems, state) {
-  const count = toolItems instanceof Set ? toolItems.size : 0;
-  if (count > 0) {
-    return `🛠️ 执行耗时 · 查看 ${count} 个步骤`;
+function buildProcessPanelTitle({ state, elapsed = "" } = {}) {
+  const timeText = elapsed || "刚刚";
+  if (state === "retrying") {
+    return `重连中 · 已处理 ${timeText}`;
   }
-  if (state === "streaming") {
-    return "🛠️ 工具执行";
+  if (state === "failed") {
+    return `处理失败 · 已处理 ${timeText}`;
   }
-  return "🛠️ 工具执行 · 无额外步骤";
+  return `已处理 ${timeText}`;
 }
 
 function buildCardKitStreamingContent(entry) {
-  return formatCardKitAssistantMarkdown(resolveAssistantReplyContent(entry));
+  return buildAssistantDisplayContent(entry).answer;
 }
 
 function buildCardKitStatusSignature(runtime, runKey, entry) {
   const toolItems = runtime.toolItemIdsByRunKey.get(runKey);
   const toolTrace = runtime.toolTraceByRunKey.get(runKey);
   const tokenUsage = runtime.latestTokenUsageByThreadId.get(entry.threadId);
+  const display = buildAssistantDisplayContent(entry);
   return JSON.stringify({
     state: entry.state,
+    statusText: entry.statusText || "",
     toolCount: toolItems instanceof Set ? toolItems.size : 0,
     toolTrace: Array.isArray(toolTrace) ? toolTrace.filter(Boolean) : [],
     reasoning: Number(tokenUsage?.last?.reasoningOutputTokens || 0),
+    notes: display.notes,
+    memory: runtime.memoryPreflightByThreadId?.get(entry.threadId) || "",
   });
 }
 
 function resolveAssistantReplyContent(entry) {
+  const answerText = typeof entry.answerText === "string" ? entry.answerText.trim() : "";
+  if (answerText) {
+    return answerText;
+  }
   const text = typeof entry.text === "string" ? entry.text.trim() : "";
   if (text) {
     return text;
@@ -568,7 +700,32 @@ function resolveAssistantReplyContent(entry) {
   if (entry.state === "completed") {
     return "我已经处理好了。";
   }
-  return "我正在整理正式回复。";
+  if (entry.state === "retrying") {
+    return entry.statusText || "模型通道正在重连。";
+  }
+  return "我正在认真处理这轮内容，结果会在这里流式出来。";
+}
+
+function buildAssistantDisplayContent(entry) {
+  const raw = resolveAssistantReplyContent(entry);
+  const explicitProcessText = typeof entry.processText === "string" ? entry.processText.trim() : "";
+  if (entry.state !== "completed") {
+    return {
+      answer: raw ? formatCardKitAssistantMarkdown(raw) : "正在处理，正式回复会在结束后显示。",
+      notes: explicitProcessText ? formatCardKitThinkingMarkdown(explicitProcessText) : "",
+    };
+  }
+  if (explicitProcessText) {
+    return {
+      answer: formatCardKitAssistantMarkdown(raw),
+      notes: formatCardKitThinkingMarkdown(explicitProcessText),
+    };
+  }
+  const split = splitAssistantReplyForDisplay(raw);
+  return {
+    answer: formatCardKitAssistantMarkdown(split.answerText),
+    notes: formatCardKitThinkingMarkdown(split.preAnswerText),
+  };
 }
 
 function buildCardKitFooter(runtime, entry) {
@@ -577,6 +734,8 @@ function buildCardKitFooter(runtime, entry) {
     parts.push("未完成");
   } else if (entry.state === "completed") {
     parts.push("已完成");
+  } else if (entry.state === "retrying") {
+    parts.push("模型通道重连中");
   } else {
     parts.push("正在回复");
   }
@@ -623,21 +782,29 @@ function buildCardKitSummary(content, state) {
   if (state === "completed") {
     return "我已经处理好了。";
   }
+  if (state === "retrying") {
+    return "模型通道重连中。";
+  }
   return "正在回复。";
 }
 
 async function flushLegacyReplyCard(runtime, runKey, entry) {
+  const legacyDisplay = entry.state === "completed"
+    ? splitAssistantReplyForDisplay(resolveAssistantReplyContent(entry))
+    : { answerText: entry.text };
   const card = buildAssistantReplyCard({
-    text: entry.text,
+    text: legacyDisplay.answerText,
     state: entry.state,
     elapsed: formatReplyElapsed(entry.startedAt),
-    model: runtime.config.defaultCodexModel || "Codex",
+    model: runtime.config.defaultCodexModel || "予安-Mira",
     toolText: formatToolTraceText(runtime.toolTraceByRunKey.get(runKey), entry.state),
     thinkingText: formatThinkingText({
       state: entry.state,
       elapsed: formatReplyElapsed(entry.startedAt),
       toolTrace: runtime.toolTraceByRunKey.get(runKey),
       tokenUsage: runtime.latestTokenUsageByThreadId.get(entry.threadId),
+      assistantNotes: buildAssistantDisplayContent(entry).notes,
+      memoryTrace: runtime.memoryPreflightByThreadId?.get(entry.threadId),
     }),
     usageText: formatUsageText(runtime.latestTokenUsageByThreadId.get(entry.threadId)),
     contextText: formatContextText(runtime.latestTokenUsageByThreadId.get(entry.threadId)),
@@ -768,6 +935,9 @@ function disposeReplyRunState(runtime, runKey, threadId) {
   if (threadId && runtime.currentRunKeyByThreadId.get(threadId) === runKey) {
     runtime.currentRunKeyByThreadId.delete(threadId);
   }
+  if (threadId && runtime.memoryPreflightByThreadId) {
+    runtime.memoryPreflightByThreadId.delete(threadId);
+  }
 }
 
 async function flushAssistantReplyCardNow(runtime, { threadId, turnId = "" } = {}) {
@@ -839,34 +1009,83 @@ function formatToolTraceText(toolTrace, state) {
   return steps.map((step) => `- ${step}`).join("\n");
 }
 
-function formatThinkingText({ state, elapsed, toolTrace, tokenUsage }) {
+function formatProcessTimelineText({ state, elapsed, toolTrace, tokenUsage, statusText = "", assistantNotes = "", memoryTrace = "" }) {
+  const sections = [];
+  const thinkingText = formatThinkingText({
+    state,
+    elapsed,
+    toolTrace,
+    tokenUsage,
+    statusText,
+    assistantNotes,
+    memoryTrace,
+  }).trim();
+  if (thinkingText) {
+    sections.push(thinkingText);
+  }
+
+  const steps = Array.isArray(toolTrace) ? toolTrace.filter(Boolean) : [];
+  if (steps.length) {
+    sections.push(["**执行记录**", ...steps.map((step) => `- ${step}`)].join("\n"));
+  }
+
+  return sections.join("\n\n").trim() || "这轮还没产生可展示的公开过程。";
+}
+
+function formatThinkingText({ state, elapsed, toolTrace, tokenUsage, statusText = "", assistantNotes = "", memoryTrace = "" }) {
   const steps = Array.isArray(toolTrace) ? toolTrace.filter(Boolean) : [];
   const reasoningTokens = Number(tokenUsage?.last?.reasoningOutputTokens || 0);
+  const publicNotes = typeof assistantNotes === "string" ? assistantNotes.trim() : "";
+  const memoryText = typeof memoryTrace === "string" ? memoryTrace.trim() : "";
+  const withMemory = (text) => memoryText ? `${memoryText}\n\n${text}` : text;
+  if (state === "retrying") {
+    return withMemory(statusText
+      ? `${statusText}\n\n这说明飞书消息已经进入 Codex，但当前模型供应商链路还没稳定返回。`
+      : "模型供应商链路正在重连；飞书桥已经收到消息，正在等待 Codex 自动恢复。");
+  }
   if (state === "failed") {
-    return elapsed
+    return withMemory(elapsed
       ? `这轮在 ${elapsed} 左右断流了，我没把它完整收住。`
-      : "这轮中途断掉了，所以我先停在这里。";
+      : "这轮中途断掉了，所以我先停在这里。");
   }
   if (state === "completed") {
+    if (publicNotes) {
+      const prefix = elapsed
+        ? `这轮已经收口，耗时约 ${elapsed}。下面是 Codex 公开给出的前置上下文/过程摘要，不是隐藏推理链：`
+        : "这轮已经收口。下面是 Codex 公开给出的前置上下文/过程摘要，不是隐藏推理链：";
+      return withMemory(`${prefix}\n\n${publicNotes}`);
+    }
     if (steps.length) {
-      return elapsed
+      return withMemory(elapsed
         ? `这轮已经收口。我先过了一遍问题，再走了 ${steps.length} 个步骤，最后在 ${elapsed} 左右把回复收好。`
-        : `这轮已经收口。我先过了一遍问题，再走了 ${steps.length} 个步骤，把回复整理好了。`;
+        : `这轮已经收口。我先过了一遍问题，再走了 ${steps.length} 个步骤，把回复整理好了。`);
     }
     if (reasoningTokens > 0) {
-      return `这轮有 ${formatCompactTokens(reasoningTokens)} 思考 token，但没有公开思考摘要；我只能展示状态摘要，不展开私密推理链。`;
+      return withMemory(`这轮有 ${formatCompactTokens(reasoningTokens)} 思考 token，但没有公开思考摘要；我只能展示状态摘要，不展开私密推理链。`);
     }
-    return elapsed
+    return withMemory(elapsed
       ? `这轮已经收口。我直接把问题想顺后，在 ${elapsed} 左右把回复整理好了。`
-      : "这轮已经收口，我把回复整理好了。";
+      : "这轮已经收口，我把回复整理好了。");
+  }
+  if (publicNotes) {
+    return withMemory(publicNotes);
   }
   if (steps.length) {
-    return `我已经开始顺这轮的路子了，当前先走了 ${steps.length} 个步骤，正在往正式回复里收。`;
+    return withMemory(`我已经开始顺这轮的路子了，当前先走了 ${steps.length} 个步骤，正在往正式回复里收。`);
   }
   if (reasoningTokens > 0) {
-    return `底层已经在思考，但当前没有公开思考摘要；我会显示可公开的阶段状态。`;
+    return withMemory(`底层已经在思考，但当前没有公开思考摘要；我会显示可公开的阶段状态。`);
   }
-  return "我先把你的意思接住，再把这轮回复往清楚的方向收。";
+  return withMemory("我先把你的意思接住，再把这轮回复往清楚的方向收。");
+}
+
+function formatCardKitThinkingMarkdown(text) {
+  const formatted = formatCardKitAssistantMarkdown(text);
+  if (Buffer.byteLength(formatted, "utf8") <= 8000) {
+    return formatted;
+  }
+  const clipped = formatted.slice(0, 3600).trim();
+  return `${clipped}\n\n_思考面板内容较长，已截断显示。_`;
 }
 
 function formatCompactTokens(value) {

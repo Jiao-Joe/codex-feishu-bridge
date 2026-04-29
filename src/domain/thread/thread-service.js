@@ -1,6 +1,7 @@
 const { filterThreadsByWorkspaceRoot } = require("../../shared/workspace-paths");
 const { extractSwitchThreadId } = require("../../shared/command-parsing");
 const codexMessageUtils = require("../../infra/codex/message-utils");
+const planRuntime = require("../plan/plan-service");
 
 const THREAD_SOURCE_KINDS = new Set([
   "app",
@@ -25,14 +26,17 @@ async function resolveWorkspaceThreadState(runtime, {
   const threads = await refreshWorkspaceThreads(runtime, bindingKey, workspaceRoot, normalized);
   const selectedThreadId = runtime.resolveThreadIdForBinding(bindingKey, workspaceRoot);
   const binding = runtime.sessionStore.getBinding(bindingKey) || {};
-  const shouldAutoSelectThread = autoSelectThread && binding.threadScopedBinding !== true;
+  const activeProviderKey = typeof binding.activeProviderKey === "string" ? binding.activeProviderKey.trim() : "";
+  const currentProviderKey = runtime.getCodexProviderKey();
+  const providerChanged = activeProviderKey && currentProviderKey && activeProviderKey !== currentProviderKey;
+  const shouldAutoSelectThread = autoSelectThread && binding.threadScopedBinding !== true && !providerChanged;
   const threadId = selectedThreadId || (shouldAutoSelectThread ? (threads[0]?.id || "") : "");
   if (!selectedThreadId && threadId) {
     runtime.sessionStore.setThreadIdForWorkspace(
       bindingKey,
       workspaceRoot,
       threadId,
-      codexMessageUtils.buildBindingMetadata(normalized)
+      buildThreadBindingExtra(runtime, normalized)
     );
   }
   if (threadId) {
@@ -51,10 +55,19 @@ async function ensureThreadAndSendMessage(runtime, { bindingKey, workspaceRoot, 
       workspaceRoot,
       normalized,
     });
+    await recordInboundSignalSafely({ runtime, normalized, workspaceRoot, threadId: createdThreadId });
+    const textWithMemory = await buildMessageWithMemoryPreflightSafely({
+      runtime,
+      text: normalized.text,
+      bindingKey,
+      workspaceRoot,
+      threadId: createdThreadId,
+    });
     console.log(`[codex-im] turn/start first message thread=${createdThreadId}`);
     await runtime.codex.sendUserMessage({
       threadId: createdThreadId,
-      text: normalized.text,
+      text: textWithMemory,
+      attachments: normalized.attachments || [],
       model: codexParams.model || null,
       effort: codexParams.effort || null,
       accessMode: runtime.config.defaultCodexAccessMode,
@@ -67,9 +80,18 @@ async function ensureThreadAndSendMessage(runtime, { bindingKey, workspaceRoot, 
 
   try {
     await ensureThreadResumed(runtime, threadId);
+    await recordInboundSignalSafely({ runtime, normalized, workspaceRoot, threadId });
+    const textWithMemory = await buildMessageWithMemoryPreflightSafely({
+      runtime,
+      text: normalized.text,
+      bindingKey,
+      workspaceRoot,
+      threadId,
+    });
     await runtime.codex.sendUserMessage({
       threadId,
-      text: normalized.text,
+      text: textWithMemory,
+      attachments: normalized.attachments || [],
       model: codexParams.model || null,
       effort: codexParams.effort || null,
       accessMode: runtime.config.defaultCodexAccessMode,
@@ -86,16 +108,25 @@ async function ensureThreadAndSendMessage(runtime, { bindingKey, workspaceRoot, 
 
     console.warn(`[codex-im] stale thread detected, recreating workspace thread: ${threadId}`);
     runtime.resumedThreadIds.delete(threadId);
-    runtime.sessionStore.clearThreadIdForWorkspace(bindingKey, workspaceRoot);
+    runtime.sessionStore.clearThreadIdForWorkspace(bindingKey, workspaceRoot, runtime.getCodexProviderKey());
     const recreatedThreadId = await createWorkspaceThread(runtime, {
       bindingKey,
       workspaceRoot,
       normalized,
     });
+    await recordInboundSignalSafely({ runtime, normalized, workspaceRoot, threadId: recreatedThreadId });
+    const textWithMemory = await buildMessageWithMemoryPreflightSafely({
+      runtime,
+      text: normalized.text,
+      bindingKey,
+      workspaceRoot,
+      threadId: recreatedThreadId,
+    });
     console.log(`[codex-im] turn/start retry thread=${recreatedThreadId}`);
     await runtime.codex.sendUserMessage({
       threadId: recreatedThreadId,
-      text: normalized.text,
+      text: textWithMemory,
+      attachments: normalized.attachments || [],
       model: codexParams.model || null,
       effort: codexParams.effort || null,
       accessMode: runtime.config.defaultCodexAccessMode,
@@ -105,6 +136,62 @@ async function ensureThreadAndSendMessage(runtime, { bindingKey, workspaceRoot, 
     runtime.setThreadWorkspaceRoot(recreatedThreadId, workspaceRoot);
     return recreatedThreadId;
   }
+}
+
+async function recordInboundSignalSafely(args) {
+  try {
+    await args.runtime?.extensions?.memoryBridge?.recordInboundSignal(args);
+  } catch (error) {
+    console.warn(`[codex-im] memory signal write skipped: ${error.message}`);
+  }
+}
+
+async function buildMessageWithMemoryPreflightSafely(args) {
+  const textWithCapabilities = planRuntime.buildMessageWithPlanMode(args.runtime, {
+    bindingKey: args.bindingKey,
+    workspaceRoot: args.workspaceRoot,
+    text: buildMessageWithBridgeCapabilities(args.text),
+  });
+  try {
+    const buildMessage = args.runtime?.extensions?.memoryBridge?.buildMessageWithMemoryPreflight;
+    const textWithMemory = typeof buildMessage === "function"
+      ? await buildMessage({ ...args, text: textWithCapabilities })
+      : textWithCapabilities;
+    recordMemoryPreflightTrace(args.runtime, {
+      threadId: args.threadId,
+      textWithCapabilities,
+      textWithMemory,
+    });
+    return textWithMemory;
+  } catch (error) {
+    console.warn(`[codex-im] memory preflight skipped: ${error.message}`);
+    return textWithCapabilities;
+  }
+}
+
+function recordMemoryPreflightTrace(runtime, { threadId, textWithCapabilities, textWithMemory } = {}) {
+  if (!runtime?.memoryPreflightByThreadId || !threadId) {
+    return;
+  }
+  if (String(textWithMemory || "") === String(textWithCapabilities || "")) {
+    runtime.memoryPreflightByThreadId.delete(threadId);
+    return;
+  }
+  runtime.memoryPreflightByThreadId.set(
+    threadId,
+    "已挂载共同记忆上下文：Codex Memory Compiler、当天每日桥接、最近 TaskNotes 和 Obsidian Recall。"
+  );
+}
+
+function buildMessageWithBridgeCapabilities(text) {
+  return [
+    "<feishu-bridge-capabilities>",
+    "[System note: This Feishu bridge can send current-workspace attachments back to Feishu. If Jiao asks you to send a local image, file, or audio, create or locate the file under the bound workspace, then include a hidden directive on its own line: [[yuan-feishu-send:relative/path/from/workspace]]. The bridge will upload it. Supported routing: images as Feishu image messages, .opus/.mp4 as audio, other files as file messages. Do not use absolute paths in the directive; keep a short human explanation separately.]",
+    "[System note: Replies are shown in Feishu CardKit. Prefer scan-friendly Markdown: short paragraphs, bold section labels, ordered/bulleted lists, Markdown tables for comparisons, fenced code blocks for commands/snippets, and horizontal rules between major sections. Avoid one dense paragraph.]",
+    "</feishu-bridge-capabilities>",
+    "",
+    text,
+  ].join("\n");
 }
 
 async function createWorkspaceThread(runtime, { bindingKey, workspaceRoot, normalized }) {
@@ -122,7 +209,7 @@ async function createWorkspaceThread(runtime, { bindingKey, workspaceRoot, norma
     bindingKey,
     workspaceRoot,
     resolvedThreadId,
-    codexMessageUtils.buildBindingMetadata(normalized)
+    buildThreadBindingExtra(runtime, normalized)
   );
   runtime.resumedThreadIds.add(resolvedThreadId);
   runtime.setPendingThreadContext(resolvedThreadId, normalized);
@@ -192,10 +279,10 @@ async function handleSwitchCommand(runtime, normalized) {
 async function refreshWorkspaceThreads(runtime, bindingKey, workspaceRoot, normalized) {
   try {
     const threads = await listCodexThreadsForWorkspace(runtime, workspaceRoot);
-    const currentThreadId = runtime.sessionStore.getThreadIdForWorkspace(bindingKey, workspaceRoot);
+    const currentThreadId = runtime.resolveThreadIdForBinding(bindingKey, workspaceRoot);
     const shouldKeepCurrentThread = currentThreadId && runtime.resumedThreadIds.has(currentThreadId);
     if (currentThreadId && !shouldKeepCurrentThread && !threads.some((thread) => thread.id === currentThreadId)) {
-      runtime.sessionStore.clearThreadIdForWorkspace(bindingKey, workspaceRoot);
+      runtime.sessionStore.clearThreadIdForWorkspace(bindingKey, workspaceRoot, runtime.getCodexProviderKey());
     }
     return threads;
   } catch (error) {
@@ -295,7 +382,7 @@ async function switchThreadById(runtime, normalized, threadId, { replyToMessageI
     bindingKey,
     resolvedWorkspaceRoot,
     threadId,
-    codexMessageUtils.buildBindingMetadata(normalized)
+    buildThreadBindingExtra(runtime, normalized)
   );
   runtime.setThreadBindingKey(threadId, bindingKey);
   runtime.setThreadWorkspaceRoot(threadId, resolvedWorkspaceRoot);
@@ -312,6 +399,17 @@ function isSupportedThreadSourceKind(sourceKind) {
 function shouldRecreateThread(error) {
   const message = String(error?.message || "").toLowerCase();
   return message.includes("thread not found") || message.includes("unknown thread");
+}
+
+function buildThreadBindingExtra(runtime, normalized) {
+  const providerState = typeof runtime.getCodexProviderState === "function"
+    ? runtime.getCodexProviderState()
+    : null;
+  return {
+    ...codexMessageUtils.buildBindingMetadata(normalized),
+    providerKey: providerState?.key || "",
+    providerLabel: providerState?.label || "",
+  };
 }
 
 module.exports = {

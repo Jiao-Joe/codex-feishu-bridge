@@ -1,16 +1,8 @@
 {
-  "name": "codex-feishu-bridge",
-  "version": "0.1.0",
-  "description": "A focused Feishu/Lark bridge for local Codex.",
+  "name": "yuan-feishu",
+  "version": "0.2.3",
+  "description": "Private Yuan Feishu bridge for local Codex.",
   "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/Jiao-Joe/codex-feishu-bridge.git"
-  },
-  "homepage": "https://github.com/Jiao-Joe/codex-feishu-bridge#readme",
-  "bugs": {
-    "url": "https://github.com/Jiao-Joe/codex-feishu-bridge/issues"
-  },
   "type": "commonjs",
   "main": "src/index.js",
   "keywords": [
@@ -19,12 +11,16 @@
     "lark",
     "bot",
     "cli",
-    "remote",
-    "gateway"
+    "remote"
   ],
   "files": [
+    ".codex-plugin",
     "bin",
     "docs",
+    "img",
+    "scripts",
+    "!scripts/__pycache__",
+    "!scripts/*.before-*",
     "src",
     "README.md",
     ".env.example"
@@ -33,6 +29,7 @@
     "node": ">=18"
   },
   "bin": {
+    "yuan-feishu": "./bin/codex-im.js",
     "codex-im": "./bin/codex-im.js"
   },
   "publishConfig": {
@@ -41,17 +38,20 @@
   "scripts": {
     "feishu-bot": "node ./bin/codex-im.js",
     "check": "find src bin scripts -name '*.js' -print0 | xargs -0 -n1 node --check",
-    "privacy:scan": "node ./scripts/privacy-scan.js",
-    "pack:dry-run": "npm pack --dry-run",
-    "check:release": "npm run check && npm run privacy:scan && npm audit --omit=dev && npm run pack:dry-run"
+    "test:markdown": "node ./scripts/test-assistant-markdown.js",
+    "test:directives": "node ./scripts/test-outbound-directives.js",
+    "test:errors": "node ./scripts/test-codex-error-events.js",
+    "test:media": "node ./scripts/test-media-fixtures.js",
+    "test:plan": "node ./scripts/test-plan-mode.js",
+    "test:provider": "node ./scripts/test-provider-routing.js",
+    "test:approval": "node ./scripts/test-approval-policy.js",
+    "test:card-content": "node ./scripts/test-card-reply-content.js",
+    "test:queue": "node ./scripts/test-message-queue.js",
+    "smoke:feishu-media": "node ./scripts/feishu-media-smoke.js"
   },
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "^1.62.0",
-    "axios": "^1.15.2",
+    "@larksuiteoapi/node-sdk": "^1.54.0",
     "dotenv": "^16.4.7",
     "ws": "^8.19.0"
-  },
-  "overrides": {
-    "axios": "^1.15.2"
   }
 }

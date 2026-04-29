@@ -1,121 +1,221 @@
-# codex-feishu-bridge
+# yuan-feishu
 
-`codex-feishu-bridge` 是一个把本机 Codex 接入飞书/Lark 的轻量插件。
+本项目完全通过Vibe Coding实现，主要特点：手机聊的电脑能继续聊，电脑聊的手机也能继续聊。在手机上可以使用命令或飞书的卡片来进行交互，快速切换项目和线程
 
-```text
-飞书消息 -> 本机 Codex app-server -> 飞书回复
-```
+`yuan-feishu` 是我们私有化的本地飞书机器人桥接层：
 
-它的定位很单一：让用户可以在飞书里远程使用本机 Codex，继续同一条 Codex 线程、切换本地项目、选择模型、审批 Codex 动作，并把回复以飞书卡片形式展示。
+`飞书消息 -> 本机 codex app-server -> 飞书回复`
 
-完整中文说明书见：[docs/使用说明.md](docs/使用说明.md)。
+Codex 操作都留在 本地，飞书只负责消息交互。
 
-架构和维护边界见：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+## 特性
 
-## 它能做什么
-
-- 在飞书里和本机 Codex 对话。
-- 把一个飞书会话绑定到一个本地项目目录。
-- 在飞书里创建、切换、恢复 Codex 线程。
-- 查看当前项目、当前线程和最近消息。
-- 设置当前项目使用的模型和推理强度。
-- 停止正在运行的 Codex 任务。
-- 通过飞书审批 Codex 发起的操作请求。
-- 把绑定项目内的文件发送到飞书。
-- 用流式飞书卡片展示 Codex 回复、工具执行和 token 用量摘要。
-
-## 它不做什么
-
-- 不内置私有知识库。
-- 不内置私人任务系统。
-- 不内置记忆编译、召回脚本或每日沉淀。
-- 不绑定任何特定团队的项目中枢或自动化系统。
-- 不携带任何密钥、token、私有 ID、本地日志或个人工作区数据。
+- 飞书长连接机器人
+- 普通对话回复
+- 卡片回复与流式更新
+- Codex 风格的实时过程卡：公开过程实时进入 `已处理 ...` 面板，正式答案开始后正文区再流式输出
+- 先加表情、后输出正文
+- 回复到触发它的原消息
+- `/codex bind` 绑定项目
+- `/codex where` 查看当前项目/线程
+- `/codex workspace` 查看当前会话已记录项目和线程
+- `/codex remove /绝对路径` 移除会话绑定项目
+- `/codex send <相对文件路径>` 发送当前绑定项目内的文件
+- `/codex switch <threadId>` 切换线程
+- `/codex message` 查看最近几轮消息
+- `/codex new` 新建线程
+- `/codex stop` 停止当前运行
+- `/codex model` / `/codex model update` / `/codex model <modelId>` 查看可用模型、刷新可用模型以及推理强度、设置模型
+- `/codex effort` / `/codex effort <low|medium|high|xhigh>` 设置推理强度
+- `/codex approve` / `/codex reject` 审批卡片
 
 ## 安装
 
+npm安装和执行：
+
 ```sh
-npm install -g codex-feishu-bridge
-codex-im feishu-bot
+npm install -g yuan-feishu
+yuan-feishu feishu-bot
 ```
 
-本地开发运行：
+开发态运行：
 
 ```sh
 npm install
 npm run feishu-bot
 ```
 
-## 基本配置
+### 执行脚本示例
 
-复制 `.env.example` 为 `.env`，填入飞书应用和 Codex 默认参数：
-
-```text
-FEISHU_APP_ID=cli_xxxxxxxxxxxxxxxxx
-FEISHU_APP_SECRET=xxxxxxxxxxxxxxxxxxxxxxxx
-CODEX_IM_DEFAULT_CODEX_MODEL=gpt-5.3-codex
-CODEX_IM_DEFAULT_CODEX_EFFORT=medium
-CODEX_IM_DEFAULT_CODEX_ACCESS_MODE=default
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+npm install -g yuan-feishu
+yuan-feishu feishu-bot
 ```
 
-配置加载顺序：
+## 配置
 
-1. 当前目录的 `.env`
+有两个配置文件：.env 和 sessions.json
+
+ `.env`。
+
+程序会按这个顺序加载配置：
+
+1. 当前目录下的 `.env`
 2. `~/.codex-im/.env`
 3. 当前 shell 环境变量
 
-## 常用命令
 
-- `/codex bind /absolute/path`
+以下是默认读取 session 文件位置，也可以通过 .env 的配置指定
+
+```text
+~/.codex-im/sessions.json
+```
+
+必填环境变量：
+
+- `FEISHU_APP_ID`
+- `FEISHU_APP_SECRET`
+- `CODEX_IM_DEFAULT_CODEX_MODEL` 新绑定项目时默认写入的模型（启动时会基于 Codex 可用模型列表校验，不合法则启动失败）
+- `CODEX_IM_DEFAULT_CODEX_EFFORT` 新绑定项目时默认写入的推理强度（启动时会基于对应模型可用推理强度校验，不合法则启动失败）
+- `CODEX_IM_DEFAULT_CODEX_ACCESS_MODE` 默认访问模式（必填：`default` / `full-access`）
+
+可选环境变量：
+
+- `CODEX_IM_DEFAULT_WORKSPACE_ID` 在session中读取当前绑定信息的key，更换key后，原来的信息虽然在session中，但是不会再读取
+- `CODEX_IM_FEISHU_STREAMING_OUTPUT`（默认 `true`，设为 `false` 则等 Codex 完成后一次性输出）
+- `CODEX_IM_CODEX_RPC_TIMEOUT_MS` Codex 普通 RPC 请求超时，默认 `45000`
+- `CODEX_IM_CODEX_TURN_START_TIMEOUT_MS` `turn/start` 请求超时，默认 `60000`
+- `CODEX_IM_STALE_TURN_TIMEOUT_MS` 飞书端运行状态兜底清理时间，默认 `1800000`（30 分钟）
+- `CODEX_IM_WORKSPACE_ALLOWLIST`允许绑定的项目白名单
+- `CODEX_IM_CODEX_ENDPOINT` 用来指定 Codex 的远程 WebSocket RPC 地址，默认是启动本地服务
+- `CODEX_IM_SESSIONS_FILE` session文件路径
+
+
+
+
+## 使用
+
+```sh
+npm run feishu-bot
+```
+
+常用命令：
+
+- `/codex bind /绝对路径`
 - `/codex where`
 - `/codex workspace`
-- `/codex remove /absolute/path`
-- `/codex send <relative-file-path>`
+- `/codex remove /绝对路径`
+- `/codex send <相对文件路径>`
 - `/codex switch <threadId>`
 - `/codex message`
 - `/codex new`
 - `/codex stop`
 - `/codex model`
 - `/codex model update`
-- `/codex model <modelId>`
 - `/codex effort`
-- `/codex effort <low|medium|high|xhigh>`
-- `/codex profile`
-- `/codex profile main`
 - `/codex approve`
-- `/codex approve workspace`
+- `/codex approve session`
 - `/codex reject`
 - `/codex help`
 
-## 飞书应用要求
+## 项目与线程模型
 
-事件订阅：
+- 一个飞书会话可以记住多个项目
+- 每个项目对应一个当前选中的 Codex 线程
+- 历史线程列表以 Codex `thread/list` 为准
+- 切换项目或线程后，后续普通消息继续发到当前线程
 
-| 事件 | 标识 |
-| --- | --- |
-| 接收消息 | `im.message.receive_v1` |
-| 卡片回传交互 | `card.action.trigger` |
+## 工作方式
 
-推荐权限：
+- 收到用户消息后，先用表情标记正在处理
+- Codex 返回内容后，飞书中以卡片形式持续更新
+- 正式答案出现前，公开过程文字、记忆预检和工具调用会实时进入上方 `已处理 ...` 折叠面板
+- 正文区在答案未开始前显示 `我正在认真处理这轮内容，结果会在这里流式出来。`
+- 检测到 `Jiao，弄好了`、`结论是`、`先说结论` 等正式答案起点后，正文区开始流式输出结果
+- 完成后保留过程面板作为可展开记录，最终 snapshot 只用于校准正文
+- 命令回执和普通对话都会优先回复到触发它的原消息
+- 审批请求会显示为交互卡片
 
-| 权限 | 标识 |
-| --- | --- |
-| 创建与更新卡片 | `cardkit:card:write` |
-| 获取卡片信息 | `cardkit:card:read` |
-| 以应用身份发消息 | `im:message:send_as_bot` |
-| 读取用户发给机器人的单聊消息 | `im:message.p2p_msg:readonly` |
-| 发送/删除表情回复 | `im:message.reactions:write_only` |
-| 获取与上传图片或文件资源 | `im:resource` |
+## 更新记录
 
-## 开发检查
+- `0.2.3`：新增实时过程卡状态机，合并工具/思考面板，修复公开过程文字在最终快照时消失的问题；详见 [`docs/2026-04-29-realtime-process-cards.md`](docs/2026-04-29-realtime-process-cards.md)。
 
-```sh
-npm run check
-npm run privacy:scan
-npm audit --omit=dev
-npm pack --dry-run
+## Gateway 控制
+
+本插件作为独立的 Yuan Feishu Gateway 运行，LaunchAgent 名称为 `com.yuan.feishu-bridge`。
+它只控制飞书桥接进程，不会停止或修改 Codex 桌面端。
+
+短命令：
+
+```bash
+codex-gateway status
+codex-gateway restart
+codex-gateway stop
+codex-gateway start
+codex-gateway logs
 ```
 
-## License
+可双击按钮位于：
 
-MIT
+```text
+/Users/keeploving/Desktop/Codex-Gateway-Buttons/
+```
+
+其中 `Status.command`、`Restart.command`、`Stop.command`、`Start.command` 分别对应查看状态、重启、停止和启动。
+
+## 开发
+
+- `src/index.js`: 启动入口
+- `src/feishu-bot.js`: 飞书机器人主逻辑
+- `src/codex-rpc-client.js`: Codex JSON-RPC 传输层
+- `src/session-store.js`: 会话绑定持久化
+- `src/config.js`: 环境变量配置
+
+
+# 飞书配置
+
+1. 在飞书平台创建机器人
+
+2. 事件权限配置
+
+| 名称 | 标识 |
+| --- | --- |
+| 消息被 reaction | `im.message.reaction.created_v1` |
+| 消息被取消 reaction | `im.message.reaction.deleted_v1` |
+| 接收消息 | `im.message.receive_v1` |
+
+3. 回调配置
+
+| 名称 | 标识 |
+| --- | --- |
+| 卡片回传交互 | `card.action.trigger` |
+
+4. 应用权限
+
+| 名称 | 标识 |
+| --- | --- |
+| 获取卡片信息 | `cardkit:card:read` |
+| 创建与更新卡片 | `cardkit:card:write` |
+| 获取与更新用户基本信息 | `contact:user.base:readonly` |
+| 读取用户发给机器人的单聊消息 | `im:message.p2p_msg:readonly` |
+| 以应用身份发消息 | `im:message:send_as_bot` |
+| 发送删除表情回复 | `im:message.reactions:write_only` |
+| 获取与上传图片或文件资源 | `im:resource` |
+
+## 媒体附件
+
+- 收图：飞书图片会下载到本地私有缓存，并作为 Codex `localImage` 输入进入当前轮。
+- 收文件/语音：飞书文件和音频会下载到本地私有缓存；文本类文件会附带安全预览，二进制文件和音频先传元信息与本地路径。
+- 回传：`/codex send <当前项目下的相对文件路径>` 会自动按类型发送，图片走飞书图片消息，`.opus/.mp4` 走音频消息，其他文件走普通文件消息。
+- 自测：`npm run test:media` 做本地 fixture 验证；`npm run smoke:feishu-media` 用 Bot 身份向已绑定会话发送 `[自动测试]` 图片、文件和可用时的音频样本。
+
+
+
+# 参考项目
+https://github.com/larksuite/openclaw-lark
+
+https://github.com/Emanuele-web04/remodex
+
+https://github.com/Dimillian/CodexMonitor

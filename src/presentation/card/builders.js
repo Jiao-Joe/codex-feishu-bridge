@@ -99,7 +99,7 @@ function buildApprovalCard(approval) {
         },
         {
           tag: "markdown",
-          content: "`自动允许` 对当前项目生效，相同命令自动允许，重启后仍保留。",
+          content: "`自动允许` 对当前项目的命令执行生效，后续 12 小时内 Codex shell 命令会自动放行，重启后仍保留到过期。",
           text_size: "notation",
         },
       ],
@@ -165,6 +165,10 @@ function buildAssistantReplyCard({ text, state, incomingText = "", elapsed = "",
       : normalizedState === "failed"
         ? "我这次没把它收稳，所以先停在这里。"
         : "我已经把这次回复收好了。";
+  const processText = [
+    resolvedThinkingText,
+    resolvedToolText ? `**执行记录**\n${resolvedToolText}` : "",
+  ].filter(Boolean).join("\n\n");
   const footer = buildAssistantReplyFooter({
     status: normalizedState === "failed" ? "未完成" : normalizedState === "completed" ? "已完成" : "正在回复",
     elapsed,
@@ -183,9 +187,9 @@ function buildAssistantReplyCard({ text, state, incomingText = "", elapsed = "",
     header: {
       title: {
         tag: "plain_text",
-        content: "Codex",
+        content: "❤️ 予安",
       },
-      template: "blue",
+      template: "red",
     },
     body: {
       elements: [
@@ -200,7 +204,7 @@ function buildAssistantReplyCard({ text, state, incomingText = "", elapsed = "",
           header: {
             title: {
               tag: "plain_text",
-              content: "🔧 工具执行",
+              content: buildAssistantReplyProcessTitle(normalizedState, elapsed),
             },
             icon: {
               tag: "standard_icon",
@@ -215,33 +219,7 @@ function buildAssistantReplyCard({ text, state, incomingText = "", elapsed = "",
           elements: [
             {
               tag: "markdown",
-              content: resolvedToolText,
-              text_size: "notation",
-            },
-          ],
-        },
-        {
-          tag: "collapsible_panel",
-          expanded: false,
-          header: {
-            title: {
-              tag: "plain_text",
-              content: normalizedState === "streaming" ? "💭 正在想" : "💭 思考完成",
-            },
-            icon: {
-              tag: "standard_icon",
-              token: "down-small-ccm_outlined",
-              size: "16px 16px",
-            },
-            icon_position: "follow_text",
-            icon_expanded_angle: -180,
-          },
-          border: { color: "grey", corner_radius: "5px" },
-          padding: "8px 8px 8px 8px",
-          elements: [
-            {
-              tag: "markdown",
-              content: resolvedThinkingText,
+              content: processText,
               text_size: "notation",
             },
           ],
@@ -263,16 +241,27 @@ function buildAssistantReplyCard({ text, state, incomingText = "", elapsed = "",
   };
 }
 
+function buildAssistantReplyProcessTitle(state, elapsed = "") {
+  const timeText = elapsed || "刚刚";
+  if (state === "retrying") {
+    return `重连中 · 已处理 ${timeText}`;
+  }
+  if (state === "failed") {
+    return `处理失败 · 已处理 ${timeText}`;
+  }
+  return `已处理 ${timeText}`;
+}
+
 function buildAssistantReplyIntro(incomingText) {
   const clean = String(incomingText || "").replace(/\s+/g, " ").trim();
   if (!clean) {
-    return "回复";
+    return "回复 Jiao";
   }
-  return `回复：${escapeCardMarkdown(clean.slice(0, 120))}`;
+  return `回复 Jiao：${escapeCardMarkdown(clean.slice(0, 120))}`;
 }
 
 function buildAssistantReplyFooter({ status = "已完成", elapsed = "", model = "", usageText = "", contextText = "", toolCountText = "" }) {
-  const parts = [status];
+  const parts = [`❤️ ${status}`];
   if (elapsed) {
     parts.push(`耗时 ${escapeCardMarkdown(elapsed)}`);
   }
@@ -285,7 +274,7 @@ function buildAssistantReplyFooter({ status = "已完成", elapsed = "", model =
   if (contextText) {
     parts.push(escapeCardMarkdown(contextText));
   }
-  parts.push(model ? escapeCardMarkdown(model) : "Codex");
+  parts.push(model ? escapeCardMarkdown(model) : "予安-Mira");
   return parts.join(" · ");
 }
 
@@ -313,6 +302,402 @@ function buildInfoCard(text, { kind = "info" } = {}) {
         },
       ],
     },
+  };
+}
+
+function buildMemoryBridgePanelCard({
+  vaultRoot = "",
+  bridgeFiles = [],
+  tasks = [],
+  platformStatus = [],
+  todayDate = "",
+} = {}) {
+  const taskLines = Array.isArray(tasks) && tasks.length
+    ? tasks.slice(0, 6).map((task, index) => (
+      `${index + 1}. [${escapeCardMarkdown(task.status || "open")}] ${escapeCardMarkdown(task.title || task.fileName || "未命名")}`
+    ))
+    : ["当前任务池里还没有可展示的待办。"];
+  const statusLines = Array.isArray(platformStatus) && platformStatus.length
+    ? platformStatus.slice(0, 5).map((item) => (
+      `- ${escapeCardMarkdown(item.platform || "Unknown")}：${escapeCardMarkdown(item.detail || item.status || "unknown")}`
+    ))
+    : ["暂时没有读取到 OpenClaw / Hermes / Gateway 状态。"];
+
+  return {
+    schema: "2.0",
+    config: {
+      wide_screen_mode: true,
+      update_multi: true,
+    },
+    header: {
+      title: {
+        tag: "plain_text",
+        content: "🧠 共同记忆桥",
+      },
+      template: "green",
+    },
+    body: {
+      elements: [
+        {
+          tag: "markdown",
+          content: [
+            "**Jiao Knowledge Wiki** 已作为 Codex、Hermes、OpenClaw 的共同事实源。",
+            "",
+            vaultRoot ? `Vault：\`${escapeCardMarkdown(vaultRoot)}\`` : "",
+            todayDate ? `今日摘要：\`${escapeCardMarkdown(todayDate)}\`` : "",
+          ].filter(Boolean).join("\n"),
+          text_size: "normal",
+        },
+        {
+          tag: "column_set",
+          flex_mode: "none",
+          columns: [
+            buildFooterButtonColumn({
+              text: "今日摘要",
+              type: "primary",
+              value: buildMemoryActionValue("today"),
+            }),
+            buildFooterButtonColumn({
+              text: "最近待办",
+              value: buildMemoryActionValue("todo_list"),
+            }),
+            buildFooterButtonColumn({
+              text: "新建待办",
+              value: buildMemoryActionValue("todo_form"),
+            }),
+            buildFooterButtonColumn({
+              text: "沉淀今天",
+              value: buildMemoryActionValue("bridge_today"),
+            }),
+            buildFooterButtonColumn({
+              text: "使用说明",
+              value: buildMemoryActionValue("help"),
+            }),
+            buildFooterButtonColumn({
+              text: "刷新",
+              value: buildMemoryActionValue("panel"),
+            }),
+          ],
+        },
+        { tag: "hr" },
+        {
+          tag: "markdown",
+          content: [
+            "**实时状态**",
+            statusLines.join("\n"),
+          ].join("\n"),
+          text_size: "notation",
+        },
+        {
+          tag: "markdown",
+          content: [
+            "**最近待办**",
+            taskLines.join("\n"),
+            "",
+            "写入新待办：发送 `/codex todo <内容>`",
+            "也可以点上方“新建待办”。",
+            "挂起事项：发送 `/codex todo suspend <内容>`",
+          ].join("\n"),
+          text_size: "notation",
+        },
+        {
+          tag: "markdown",
+          content: [
+            "**Agent 必读入口**",
+            ...bridgeFiles.slice(0, 4).map((item) => `- \`${escapeCardMarkdown(item)}\``),
+          ].join("\n"),
+          text_size: "notation",
+        },
+      ],
+    },
+  };
+}
+
+function buildDailyBridgeSummaryCard({
+  dateText = "",
+  focus = [],
+  nextActions = [],
+  watches = [],
+  signals = [],
+  tasks = [],
+  platformStatus = [],
+  bridgeFiles = [],
+} = {}) {
+  const statusLines = Array.isArray(platformStatus) && platformStatus.length
+    ? platformStatus.slice(0, 4).map((item) => (
+      `- ${escapeCardMarkdown(item.platform || "Unknown")}：${escapeCardMarkdown(item.detail || item.status || "unknown")}`
+    ))
+    : ["暂时没有读取到平台状态。"];
+  const focusLines = normalizeCardLines(focus, "今天还没有形成可展示的摘要。", 4);
+  const nextLines = normalizeCardLines(nextActions, "暂无自动识别的下一步。", 4);
+  const watchLines = normalizeCardLines(watches, "暂无额外观察项。", 3);
+  const signalLines = Array.isArray(signals) && signals.length
+    ? signals.slice(-5).map((item) => (
+      `- ${escapeCardMarkdown(item.time || "")} ${escapeCardMarkdown(item.message || "未提取消息")}`.trim()
+    ))
+    : ["今日暂无飞书入站信号。"];
+  const taskLines = Array.isArray(tasks) && tasks.length
+    ? tasks.slice(0, 6).map((task, index) => (
+      `${index + 1}. [${escapeCardMarkdown(task.status || "open")}] ${escapeCardMarkdown(task.title || task.fileName || "未命名")}`
+    ))
+    : ["今天暂无任务池变化。"];
+
+  return {
+    schema: "2.0",
+    config: {
+      wide_screen_mode: true,
+      update_multi: true,
+    },
+    header: {
+      title: {
+        tag: "plain_text",
+        content: "🧠 今日记忆摘要",
+      },
+      template: "green",
+    },
+    body: {
+      elements: [
+        {
+          tag: "markdown",
+          content: [
+            dateText ? `日期：\`${escapeCardMarkdown(dateText)}\`` : "",
+            "这是每日桥接的飞书卡片版，只放今天最该看的内容。",
+          ].filter(Boolean).join("\n"),
+          text_size: "normal",
+        },
+        {
+          tag: "column_set",
+          flex_mode: "none",
+          columns: [
+            buildFooterButtonColumn({
+              text: "刷新摘要",
+              type: "primary",
+              value: buildMemoryActionValue("today"),
+            }),
+            buildFooterButtonColumn({
+              text: "最近待办",
+              value: buildMemoryActionValue("todo_list"),
+            }),
+            buildFooterButtonColumn({
+              text: "新建待办",
+              value: buildMemoryActionValue("todo_form"),
+            }),
+            buildFooterButtonColumn({
+              text: "记忆桥",
+              value: buildMemoryActionValue("panel"),
+            }),
+          ],
+        },
+        { tag: "hr" },
+        {
+          tag: "markdown",
+          content: [
+            "**当前最该看**",
+            ...focusLines.map((item) => `- ${escapeCardMarkdown(item)}`),
+          ].join("\n"),
+          text_size: "notation",
+        },
+        {
+          tag: "markdown",
+          content: [
+            "**其次处理**",
+            ...nextLines.map((item) => `- ${escapeCardMarkdown(item)}`),
+          ].join("\n"),
+          text_size: "notation",
+        },
+        {
+          tag: "markdown",
+          content: [
+            "**需要观察**",
+            ...watchLines.map((item) => `- ${escapeCardMarkdown(item)}`),
+          ].join("\n"),
+          text_size: "notation",
+        },
+        {
+          tag: "markdown",
+          content: [
+            "**实时状态**",
+            statusLines.join("\n"),
+          ].join("\n"),
+          text_size: "notation",
+        },
+        {
+          tag: "markdown",
+          content: [
+            "**今日飞书信号**",
+            signalLines.join("\n"),
+          ].join("\n"),
+          text_size: "notation",
+        },
+        {
+          tag: "markdown",
+          content: [
+            "**今日任务池**",
+            taskLines.join("\n"),
+          ].join("\n"),
+          text_size: "notation",
+        },
+        {
+          tag: "markdown",
+          content: [
+            "**Agent 必读入口**",
+            ...bridgeFiles.slice(0, 4).map((item) => `- \`${escapeCardMarkdown(item)}\``),
+          ].join("\n"),
+          text_size: "notation",
+        },
+      ],
+    },
+  };
+}
+
+function buildTodoFormCard() {
+  return {
+    schema: "2.0",
+    config: {
+      wide_screen_mode: true,
+      update_multi: true,
+    },
+    header: {
+      title: {
+        tag: "plain_text",
+        content: "📝 新建待办",
+      },
+      template: "blue",
+    },
+    body: {
+      elements: [
+        {
+          tag: "markdown",
+          content: "把临时想法、后续动作或挂起事项直接写入 Obsidian TaskNotes。",
+          text_size: "normal",
+        },
+        {
+          tag: "form",
+          name: "todo_form",
+          elements: [
+            {
+              tag: "input",
+              name: "title",
+              label: {
+                tag: "plain_text",
+                content: "待办内容",
+              },
+              label_position: "top",
+              placeholder: {
+                tag: "plain_text",
+                content: "例如：整理 Codex 飞书记忆桥发布说明",
+              },
+              max_length: 160,
+            },
+            buildFormSubmitButton({
+              name: "todo_submit_normal",
+              text: "普通",
+              type: "primary",
+              value: buildMemoryActionValue("todo_submit", {
+                priority: "normal",
+                taskType: "task",
+              }),
+            }),
+            buildFormSubmitButton({
+              name: "todo_submit_high",
+              text: "高优先级",
+              type: "danger",
+              value: buildMemoryActionValue("todo_submit", {
+                priority: "high",
+                taskType: "task",
+              }),
+            }),
+            buildFormSubmitButton({
+              name: "todo_submit_suspended",
+              text: "挂起",
+              value: buildMemoryActionValue("todo_submit", {
+                priority: "normal",
+                taskType: "suspended",
+              }),
+            }),
+          ],
+        },
+      ],
+    },
+  };
+}
+
+function normalizeCardLines(items, fallback, limit) {
+  const lines = Array.isArray(items)
+    ? items.map((item) => String(item || "").replace(/^[-*]\s+/, "").trim()).filter(Boolean)
+    : [];
+  return (lines.length ? lines : [fallback]).slice(0, limit);
+}
+
+function buildThreadRow({ thread, isCurrent, currentThreadStatusText = "" }) {
+  return {
+    tag: "column_set",
+    flex_mode: "none",
+    columns: [
+      {
+        tag: "column",
+        width: "weighted",
+        weight: 5,
+        vertical_align: "top",
+        elements: [
+          {
+            tag: "markdown",
+            content: [
+              `${isCurrent ? "🟢 当前" : "⚪ 历史"} · **${formatThreadLabel(thread)}**${isCurrent && currentThreadStatusText ? ` · ${currentThreadStatusText}` : ""}`,
+              formatThreadIdLine(thread),
+              summarizeThreadPreview(thread),
+            ].filter(Boolean).join("\n"),
+            text_size: "notation",
+          },
+        ],
+      },
+      {
+        tag: "column",
+        width: "auto",
+        vertical_align: "center",
+        elements: isCurrent
+          ? [
+            {
+              tag: "column_set",
+              flex_mode: "none",
+              columns: [
+                {
+                  tag: "column",
+                  width: "auto",
+                  elements: [
+                    {
+                      tag: "button",
+                      text: { tag: "plain_text", content: "最近消息" },
+                      type: "primary",
+                      value: buildThreadActionValue("messages", thread.id),
+                    },
+                  ],
+                },
+                {
+                  tag: "column",
+                  width: "auto",
+                  elements: [
+                    {
+                      tag: "button",
+                      text: { tag: "plain_text", content: "当前" },
+                      type: "default",
+                      disabled: true,
+                    },
+                  ],
+                },
+              ],
+            },
+          ]
+          : [
+            {
+              tag: "button",
+              text: { tag: "plain_text", content: "切换" },
+              type: "primary",
+              value: buildThreadActionValue("switch", thread.id),
+            },
+          ],
+      },
+    ],
   };
 }
 
@@ -442,8 +827,8 @@ function buildStatusPanelCard({
     value: buildPanelActionValue("new_thread"),
   }));
   footerColumns.push(buildFooterButtonColumn({
-    text: "状态",
-    value: buildPanelActionValue("status"),
+    text: "记忆桥",
+    value: buildMemoryActionValue("panel"),
   }));
   if (isRunning) {
     footerColumns.push(buildFooterButtonColumn({
@@ -554,9 +939,10 @@ function buildHelpCardText() {
       "从当前飞书会话中移除指定项目（不能移除当前项目）。",
     ],
     [
-      "**发送当前项目内文件**",
+      "**发送当前项目内附件**",
       "`/codex send <相对文件路径>`",
-      "把当前项目内的文件发送到当前飞书会话。",
+      "把当前项目内的文件发送到当前飞书会话；图片会按图片消息发送，`.opus/.mp4` 会按音频发送，其他走普通文件。",
+      "助手也可以在回答里使用隐藏指令 `[[yuan-feishu-send:相对路径]]` 主动触发发送。",
     ],
     [
       "**切换到指定线程**",
@@ -590,7 +976,42 @@ function buildHelpCardText() {
       "**切换 Codex 运行档**",
       "`/codex profile`",
       "`/codex profile main`",
+      "`/codex profile deepseek`",
       "按需切换飞书桥背后的 Codex app-server。",
+    ],
+    [
+      "**查看模型通道绑定**",
+      "`/codex provider`",
+      "查看当前官方/中转等模型通道指纹，以及该通道绑定的 Codex 线程。",
+    ],
+    [
+      "**计划模式**",
+      "`/codex plan`",
+      "`/codex plan on`",
+      "`/codex plan off`",
+      "开启后普通消息会先讨论边界和方案，不直接施工；也可以用卡片按钮开关。",
+    ],
+    [
+      "**共同记忆桥**",
+      "`/codex memory`",
+      "`/codex memory compile`",
+      "`/codex today`",
+      "`/codex today YYYY-MM-DD`",
+      "查看 Jiao Knowledge Wiki 入口、每日桥接摘要，或手动编译 Codex 外置记忆快照。",
+    ],
+    [
+      "**每日沉淀**",
+      "`/codex bridge`",
+      "`/codex bridge <补充说明>`",
+      "更新当天 Obsidian 每日桥接摘要的自动区。",
+    ],
+    [
+      "**TaskNotes 待办**",
+      "`/codex todo <内容>`",
+      "`/codex todo !high <内容>`",
+      "`/codex todo suspend <内容>`",
+      "`/codex todo list`",
+      "把待办或挂起事项写入 Obsidian TaskNotes；也可以在 `/codex memory` 面板点“新建待办”。",
     ],
     [
       "**审批命令**",
@@ -839,6 +1260,9 @@ function formatApprovalReason(reason) {
   if (!normalized) {
     return "";
   }
+  if (/write\s+.*\btask\b.*\bobsidian\b.*\btask\s+pool\b/i.test(normalized)) {
+    return "写入待办到 Obsidian 任务池";
+  }
   if (/run\s+this\s+command/i.test(normalized)) {
     return "执行这条命令需要授权";
   }
@@ -849,6 +1273,9 @@ function formatApprovalCommandSummary(command) {
   const normalized = compactApprovalText(command);
   if (!normalized) {
     return "";
+  }
+  if (/Jiao Knowledge Wiki/.test(normalized) && /任务池|TaskNotes|task pool/i.test(normalized)) {
+    return "写入 Jiao Knowledge Wiki 的 Obsidian 任务池";
   }
   if (/\bcat\s*>/.test(normalized) || /<<\s*['"]?EOF['"]?/.test(normalized)) {
     return "写入本地文件";
@@ -917,6 +1344,11 @@ function cleanApprovalPath(value) {
 
 function formatApprovalTargetDisplay(value) {
   const cleaned = cleanApprovalPath(value);
+  const wikiMarker = "Jiao Knowledge Wiki/";
+  const wikiIndex = cleaned.indexOf(wikiMarker);
+  if (wikiIndex >= 0) {
+    return truncateApprovalText(cleaned.slice(wikiIndex).replace(/\//g, " / "), 120);
+  }
   return truncateApprovalText(cleaned, 160);
 }
 
@@ -961,6 +1393,14 @@ function buildPanelActionValue(action) {
   return {
     kind: "panel",
     action,
+  };
+}
+
+function buildMemoryActionValue(action, extra = {}) {
+  return {
+    kind: "memory",
+    action,
+    ...extra,
   };
 }
 
@@ -1359,6 +1799,9 @@ module.exports = {
   buildCardToast,
   buildHelpCardText,
   buildInfoCard,
+  buildDailyBridgeSummaryCard,
+  buildMemoryBridgePanelCard,
+  buildTodoFormCard,
   buildModelInfoText,
   buildModelListText,
   buildModelValidationErrorText,

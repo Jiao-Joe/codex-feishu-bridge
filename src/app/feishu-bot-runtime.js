@@ -4,6 +4,7 @@ const { CodexRpcClient } = require("../infra/codex/rpc-client");
 const {
   buildCardResponse,
   buildCardToast,
+  buildDailyBridgeSummaryCard,
   buildEffortInfoText,
   buildEffortListText,
   buildEffortValidationErrorText,
@@ -11,9 +12,11 @@ const {
   buildModelInfoText,
   buildModelListText,
   buildModelValidationErrorText,
+  buildMemoryBridgePanelCard,
   buildStatusPanelCard,
   buildThreadMessagesSummary,
   buildThreadPickerCard,
+  buildTodoFormCard,
   buildWorkspaceBindingsCard,
   listBoundWorkspaces,
 } = require("../presentation/card/builders");
@@ -44,11 +47,14 @@ const runtimeCommands = require("./command-dispatcher");
 const approvalRuntime = require("../domain/approval/approval-service");
 const runtimeState = require("../domain/session/binding-context");
 const threadRuntime = require("../domain/thread/thread-service");
+const messageQueueRuntime = require("../domain/thread/message-queue");
+const planRuntime = require("../domain/plan/plan-service");
 const workspaceRuntime = require("../domain/workspace/workspace-service");
 const runtimeExtensions = require("./runtime-extensions");
 const eventsRuntime = require("./codex-event-service");
 const approvalPolicyRuntime = require("../domain/approval/approval-policy");
 const appDispatcher = require("./dispatcher");
+const { readCodexProviderState } = require("../infra/codex/provider-fingerprint");
 const { extractModelCatalogFromListResponse } = require("../shared/model-catalog");
 const { extractProfileValue } = require("../shared/command-parsing");
 const fs = require("fs");
@@ -87,18 +93,25 @@ class FeishuBotRuntime {
     this.replyFlushTimersByRunKey = new Map();
     this.replyFlushInFlightByRunKey = new Map();
     this.replyFlushQueuedByRunKey = new Set();
+    this.sentAttachmentDirectiveKeys = new Set();
+    this.planConfirmationKeys = new Set();
+    this.planQuestionKeys = new Set();
     this.latestTokenUsageByThreadId = new Map();
     this.toolItemIdsByRunKey = new Map();
     this.toolTraceByRunKey = new Map();
+    this.memoryPreflightByThreadId = new Map();
     this.assistantDeltaSeenByRunKey = new Map();
     this.pendingReactionByBindingKey = new Map();
     this.pendingReactionByThreadId = new Map();
+    this.messageQueueByThreadId = new Map();
+    this.interruptingThreadIds = new Set();
     this.bindingKeyByThreadId = new Map();
     this.workspaceRootByThreadId = new Map();
     this.approvalAllowlistByWorkspaceRoot = new Map();
     this.inFlightApprovalRequestKeys = new Set();
     this.resumedThreadIds = new Set();
     this.staleTurnWatchdog = null;
+    this.memoryBridgeScheduler = null;
     this.extensions = runtimeExtensions;
     this.codex.onMessage((message) => appDispatcher.onCodexMessage(this, message));
   }
@@ -111,6 +124,9 @@ class FeishuBotRuntime {
     await this.refreshAvailableModelCatalogAtStartup();
     this.startLongConnection();
     this.startStaleTurnWatchdog();
+    if (typeof this.extensions?.memoryBridge?.startDailyBridgeScheduler === "function") {
+      this.memoryBridgeScheduler = this.extensions.memoryBridge.startDailyBridgeScheduler();
+    }
     console.log(`[codex-im] feishu-bot runtime ready for app ${maskSecret(this.config.feishu.appId)}`);
   }
 
@@ -272,6 +288,7 @@ class FeishuBotRuntime {
       senderBindingKey,
       inheritedWorkspaceRoot
     );
+    const provider = this.getCodexProviderState();
 
     this.sessionStore.setThreadIdForWorkspace(
       bindingKey,
@@ -284,6 +301,8 @@ class FeishuBotRuntime {
         senderId: normalized.senderId,
         inheritedFromBindingKey: senderBindingKey,
         threadScopedBinding: true,
+        providerKey: provider.key,
+        providerLabel: provider.label,
       }
     );
     if (inheritedParams.model || inheritedParams.effort) {
@@ -311,6 +330,38 @@ class FeishuBotRuntime {
 
   describeCodexAppServerProfile() {
     return this.codexAppServerProfile || "main";
+  }
+
+  getCodexProviderState() {
+    return readCodexProviderState({
+      appServerProfile: this.describeCodexAppServerProfile(),
+    });
+  }
+
+  getCodexProviderKey() {
+    return this.getCodexProviderState().key;
+  }
+
+  async handleProviderCommand(normalized) {
+    const { bindingKey, workspaceRoot } = this.getBindingContext(normalized);
+    const provider = this.getCodexProviderState();
+    const threadId = workspaceRoot ? this.resolveThreadIdForBinding(bindingKey, workspaceRoot) : "";
+    const binding = this.sessionStore.getBinding(bindingKey) || {};
+    const legacyThreadId = workspaceRoot
+      ? this.sessionStore.getThreadIdForWorkspace(bindingKey, workspaceRoot)
+      : "";
+    await this.sendInfoCardMessage({
+      chatId: normalized.chatId,
+      replyToMessageId: normalized.messageId,
+      text: [
+        `当前模型通道：${provider.label}`,
+        `provider key: \`${provider.key}\``,
+        workspaceRoot ? `项目：\`${workspaceRoot}\`` : "项目：未绑定",
+        threadId ? `当前通道线程：\`${threadId}\`` : "当前通道线程：未绑定，下一条消息会自动创建新线程",
+        legacyThreadId && legacyThreadId !== threadId ? `最近显示线程：\`${legacyThreadId}\`` : "",
+        binding.activeProviderLabel ? `上次活跃通道：${binding.activeProviderLabel}` : "",
+      ].filter(Boolean).join("\n"),
+    });
   }
 
   async switchCodexAppServerProfile(profileAlias) {
@@ -451,16 +502,19 @@ function attachRuntimeForwarders() {
   const plainForwarders = {
     buildCardResponse,
     buildCardToast,
+    buildDailyBridgeSummaryCard,
     buildEffortInfoText,
     buildEffortListText,
     buildEffortValidationErrorText,
     buildHelpCardText,
+    buildMemoryBridgePanelCard,
     buildModelInfoText,
     buildModelListText,
     buildModelValidationErrorText,
     buildStatusPanelCard,
     buildThreadMessagesSummary,
     buildThreadPickerCard,
+    buildTodoFormCard,
     buildWorkspaceBindingsCard,
     listBoundWorkspaces,
   };
@@ -505,6 +559,15 @@ function attachRuntimeForwarders() {
     handleSendCommand: workspaceRuntime.handleSendCommand,
     handleModelCommand: workspaceRuntime.handleModelCommand,
     handleEffortCommand: workspaceRuntime.handleEffortCommand,
+    handleBridgeCommand: runtimeExtensions.memoryBridge.handleBridgeCommand,
+    handleMemoryCommand: runtimeExtensions.memoryBridge.handleMemoryCommand,
+    handleMemoryHelpCommand: runtimeExtensions.memoryBridge.handleMemoryHelpCommand,
+    handleTodayCommand: runtimeExtensions.memoryBridge.handleTodayCommand,
+    handleTodoCommand: runtimeExtensions.memoryBridge.handleTodoCommand,
+    handleTodoFormCommand: runtimeExtensions.memoryBridge.handleTodoFormCommand,
+    handleTodoSubmitCardAction: runtimeExtensions.memoryBridge.handleTodoSubmitCardAction,
+    handleRecallCommand: runtimeExtensions.memoryBridge.handleRecallCommand,
+    handleHubCommand: runtimeExtensions.hub.handleHubCommand,
     refreshWorkspaceThreads: threadRuntime.refreshWorkspaceThreads,
     describeWorkspaceStatus: threadRuntime.describeWorkspaceStatus,
     switchThreadById: threadRuntime.switchThreadById,
@@ -518,12 +581,15 @@ function attachRuntimeForwarders() {
     patchInteractiveCard,
     handleCardAction,
     dispatchCardAction: runtimeCommands.dispatchCardAction,
+    handleMemoryCardAction: runtimeCommands.handleMemoryCardAction,
     handlePanelCardAction: runtimeCommands.handlePanelCardAction,
     handleThreadCardAction: runtimeCommands.handleThreadCardAction,
     handleWorkspaceCardAction: runtimeCommands.handleWorkspaceCardAction,
     queueCardActionWithFeedback,
     runCardActionTask,
     handleApprovalCardActionAsync: approvalRuntime.handleApprovalCardActionAsync,
+    handlePlanCardAction: planRuntime.handlePlanCardAction,
+    handlePlanCommand: planRuntime.handlePlanCommand,
     sendCardActionFeedbackByContext,
     sendCardActionFeedback,
     switchWorkspaceByPath: workspaceRuntime.switchWorkspaceByPath,
@@ -537,6 +603,10 @@ function attachRuntimeForwarders() {
     disposeReplyRunState,
     cleanupThreadRuntimeState: runtimeState.cleanupThreadRuntimeState,
     pruneRuntimeMapSizes: runtimeState.pruneRuntimeMapSizes,
+    clearThreadMessageQueue: messageQueueRuntime.clearThreadMessageQueue,
+    drainNextThreadMessage: messageQueueRuntime.drainNextThreadMessage,
+    enqueueThreadMessage: messageQueueRuntime.enqueueThreadMessage,
+    getThreadMessageQueueSize: messageQueueRuntime.getThreadMessageQueueSize,
   };
 
   for (const [methodName, fn] of Object.entries(runtimeFirstForwarders)) {
@@ -555,6 +625,45 @@ attachRuntimeForwarders();
 FeishuBotRuntime.prototype.sendFileMessage = function sendFileMessage(args) {
   return this.requireFeishuAdapter().sendFileMessage(args);
 };
+
+FeishuBotRuntime.prototype.sendImageMessage = function sendImageMessage(args) {
+  return this.requireFeishuAdapter().sendImageMessage(args);
+};
+
+FeishuBotRuntime.prototype.sendLocalAttachmentToFeishu = function sendLocalAttachmentToFeishu(args) {
+  return this.requireFeishuAdapter().sendLocalAttachmentToFeishu
+    ? this.requireFeishuAdapter().sendLocalAttachmentToFeishu(args)
+    : sendLocalAttachmentWithRuntime(this, args);
+};
+
+async function sendLocalAttachmentWithRuntime(runtime, {
+  kind,
+  chatId,
+  fileName,
+  fileBuffer,
+  fileType = "stream",
+  msgType = "file",
+  replyToMessageId = "",
+  replyInThread = false,
+}) {
+  if (kind === "image") {
+    return runtime.sendImageMessage({
+      chatId,
+      imageBuffer: fileBuffer,
+      replyToMessageId,
+      replyInThread,
+    });
+  }
+  return runtime.sendFileMessage({
+    chatId,
+    fileName,
+    fileBuffer,
+    fileType,
+    msgType,
+    replyToMessageId,
+    replyInThread,
+  });
+}
 
 function maskSecret(value) {
   if (!value) {

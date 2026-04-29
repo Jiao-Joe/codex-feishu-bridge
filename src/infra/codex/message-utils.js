@@ -32,9 +32,6 @@ function mapCodexMessageToImEvent(message, options = {}) {
   const suppressCompletedAssistantText = Boolean(options.suppressCompletedAssistantText);
 
   if (isAssistantMessageMethod(method, params)) {
-    if (suppressCompletedAssistantText && method === "item/completed") {
-      return null;
-    }
     const text = extractAssistantText(method, params);
     if (!text) {
       return null;
@@ -45,6 +42,10 @@ function mapCodexMessageToImEvent(message, options = {}) {
         threadId,
         turnId,
         text,
+        mode: method === "item/completed"
+          ? "completed_snapshot"
+          : "delta",
+        suppressStreamingDuplicate: suppressCompletedAssistantText && method === "item/completed",
       },
     };
   }
@@ -96,17 +97,27 @@ function mapCodexMessageToImEvent(message, options = {}) {
     };
   }
 
-  if (method === "error" && isRecoverableStreamDisconnect(params)) {
+  if (method === "error") {
     if (params?.willRetry) {
-      return null;
+      const text = extractCodexRetryText(params);
+      return {
+        type: "im.run_state",
+        payload: {
+          threadId,
+          turnId,
+          state: "retrying",
+          text: text ? `模型通道重连中：${text}` : "模型通道重连中，正在等待 Codex 自动恢复。",
+        },
+      };
     }
+    const text = extractCodexErrorText(params);
     return {
       type: "im.run_state",
       payload: {
         threadId,
         turnId,
         state: "failed",
-        text: extractCodexErrorText(params) || "这次连接断开了，你直接重试我就接着来。",
+        text: text ? `执行失败：${text}` : "执行失败：Codex 返回了错误，但没有给出详细信息。",
       },
     };
   }
@@ -290,6 +301,19 @@ function extractCodexErrorText(params) {
   }
   const details = String(params?.error?.additionalDetails || "").trim();
   return details;
+}
+
+function extractCodexRetryText(params) {
+  const message = extractCodexErrorText(params);
+  if (message) {
+    return message;
+  }
+  const attempt = Number(params?.retryAttempt || params?.attempt || 0);
+  const maxAttempts = Number(params?.maxRetries || params?.maxAttempts || 0);
+  if (attempt > 0 && maxAttempts > 0) {
+    return `Reconnecting... ${attempt}/${maxAttempts}`;
+  }
+  return "";
 }
 
 function extractAssistantText(method, params) {
@@ -645,6 +669,8 @@ module.exports = {
   buildBindingMetadata,
   buildRunKey,
   eventShouldClearPendingReaction,
+  extractCodexErrorText,
+  extractCodexRetryText,
   extractCreatedMessageId,
   extractThreadId,
   extractThreadListCursor,

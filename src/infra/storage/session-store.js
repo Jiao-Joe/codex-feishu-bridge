@@ -2,6 +2,8 @@ const fs = require("fs");
 const path = require("path");
 const { normalizeModelCatalog } = require("../../shared/model-catalog");
 
+const DEFAULT_APPROVAL_AUTO_ALLOW_TTL_MS = 12 * 60 * 60 * 1000;
+
 class SessionStore {
   constructor({ filePath }) {
     this.filePath = filePath;
@@ -25,6 +27,7 @@ class SessionStore {
           ...parsed,
           bindings: parsed.bindings || {},
           approvalCommandAllowlistByWorkspaceRoot: parsed.approvalCommandAllowlistByWorkspaceRoot || {},
+          approvalCommandAutoAllowByWorkspaceRoot: parsed.approvalCommandAutoAllowByWorkspaceRoot || {},
           availableModelCatalog: parsed.availableModelCatalog || {
             models: [],
             updatedAt: "",
@@ -63,12 +66,17 @@ class SessionStore {
     });
   }
 
-  getThreadIdForWorkspace(bindingKey, workspaceRoot) {
+  getThreadIdForWorkspace(bindingKey, workspaceRoot, providerKey = "") {
     const normalizedWorkspaceRoot = normalizeValue(workspaceRoot);
     if (!normalizedWorkspaceRoot) {
       return "";
     }
-    return this.state.bindings[bindingKey]?.threadIdByWorkspaceRoot?.[normalizedWorkspaceRoot] || "";
+    const normalizedProviderKey = normalizeValue(providerKey);
+    const binding = this.state.bindings[bindingKey] || {};
+    if (normalizedProviderKey) {
+      return binding.providerThreadIdByWorkspaceRoot?.[normalizedWorkspaceRoot]?.[normalizedProviderKey] || "";
+    }
+    return binding.threadIdByWorkspaceRoot?.[normalizedWorkspaceRoot] || "";
   }
 
   setThreadIdForWorkspace(bindingKey, workspaceRoot, threadId, extra = {}) {
@@ -77,35 +85,57 @@ class SessionStore {
       return this.getBinding(bindingKey);
     }
 
+    const { providerKey, providerLabel, ...bindingExtra } = extra || {};
+    const normalizedProviderKey = normalizeValue(providerKey);
+    const normalizedProviderLabel = normalizeValue(providerLabel);
     const current = this.getBinding(bindingKey) || {};
     const threadIdByWorkspaceRoot = {
       ...getThreadMap(current),
       [normalizedWorkspaceRoot]: threadId,
     };
+    const providerThreadIdByWorkspaceRoot = getProviderThreadMap(current);
+    if (normalizedProviderKey) {
+      providerThreadIdByWorkspaceRoot[normalizedWorkspaceRoot] = {
+        ...(providerThreadIdByWorkspaceRoot[normalizedWorkspaceRoot] || {}),
+        [normalizedProviderKey]: threadId,
+      };
+    }
 
     return this.updateBinding(bindingKey, {
       ...current,
-      ...extra,
+      ...bindingExtra,
       activeWorkspaceRoot: normalizedWorkspaceRoot,
+      activeProviderKey: normalizedProviderKey || normalizeValue(current.activeProviderKey),
+      activeProviderLabel: normalizedProviderLabel || normalizeValue(current.activeProviderLabel),
       threadIdByWorkspaceRoot,
+      providerThreadIdByWorkspaceRoot,
     });
   }
 
-  clearThreadIdForWorkspace(bindingKey, workspaceRoot) {
+  clearThreadIdForWorkspace(bindingKey, workspaceRoot, providerKey = "") {
     const normalizedWorkspaceRoot = normalizeValue(workspaceRoot);
     if (!normalizedWorkspaceRoot) {
       return this.getBinding(bindingKey);
     }
 
+    const normalizedProviderKey = normalizeValue(providerKey);
     const current = this.getBinding(bindingKey) || {};
     const threadIdByWorkspaceRoot = {
       ...getThreadMap(current),
       [normalizedWorkspaceRoot]: "",
     };
+    const providerThreadIdByWorkspaceRoot = getProviderThreadMap(current);
+    if (normalizedProviderKey && providerThreadIdByWorkspaceRoot[normalizedWorkspaceRoot]) {
+      providerThreadIdByWorkspaceRoot[normalizedWorkspaceRoot] = {
+        ...providerThreadIdByWorkspaceRoot[normalizedWorkspaceRoot],
+        [normalizedProviderKey]: "",
+      };
+    }
 
     return this.updateBinding(bindingKey, {
       ...current,
       threadIdByWorkspaceRoot,
+      providerThreadIdByWorkspaceRoot,
     });
   }
 
@@ -155,6 +185,47 @@ class SessionStore {
       return [];
     }
     return normalizeCommandAllowlist(allowlist);
+  }
+
+  getApprovalCommandAutoAllowForWorkspace(workspaceRoot) {
+    const normalizedWorkspaceRoot = normalizeValue(workspaceRoot);
+    if (!normalizedWorkspaceRoot) {
+      return false;
+    }
+    const raw = this.state.approvalCommandAutoAllowByWorkspaceRoot?.[normalizedWorkspaceRoot];
+    if (raw === true) {
+      return true;
+    }
+    if (!raw || typeof raw !== "object" || raw.enabled !== true) {
+      return false;
+    }
+    const expiresAt = Date.parse(raw.expiresAt || "");
+    return Number.isNaN(expiresAt) || expiresAt > Date.now();
+  }
+
+  setApprovalCommandAutoAllowForWorkspace(workspaceRoot, enabled = true) {
+    const normalizedWorkspaceRoot = normalizeValue(workspaceRoot);
+    if (!normalizedWorkspaceRoot) {
+      return null;
+    }
+
+    const now = new Date();
+    this.state.approvalCommandAutoAllowByWorkspaceRoot = {
+      ...(this.state.approvalCommandAutoAllowByWorkspaceRoot || {}),
+      [normalizedWorkspaceRoot]: enabled === true
+        ? {
+          enabled: true,
+          updatedAt: now.toISOString(),
+          expiresAt: new Date(now.getTime() + DEFAULT_APPROVAL_AUTO_ALLOW_TTL_MS).toISOString(),
+        }
+        : {
+          enabled: false,
+          updatedAt: now.toISOString(),
+          expiresAt: "",
+        },
+    };
+    this.save();
+    return this.state.approvalCommandAutoAllowByWorkspaceRoot[normalizedWorkspaceRoot];
   }
 
   getAvailableModelCatalog() {
@@ -219,6 +290,7 @@ class SessionStore {
 
     const current = this.getBinding(bindingKey) || {};
     const threadIdByWorkspaceRoot = getThreadMap(current);
+    const providerThreadIdByWorkspaceRoot = getProviderThreadMap(current);
     const codexParamsByWorkspaceRoot = getCodexParamsMap(current);
     const hasWorkspaceEntry = Object.prototype.hasOwnProperty.call(
       threadIdByWorkspaceRoot,
@@ -230,6 +302,7 @@ class SessionStore {
     }
 
     delete threadIdByWorkspaceRoot[normalizedWorkspaceRoot];
+    delete providerThreadIdByWorkspaceRoot[normalizedWorkspaceRoot];
     delete codexParamsByWorkspaceRoot[normalizedWorkspaceRoot];
 
     const nextActiveWorkspaceRoot = activeWorkspaceRoot === normalizedWorkspaceRoot
@@ -240,6 +313,7 @@ class SessionStore {
       ...current,
       activeWorkspaceRoot: nextActiveWorkspaceRoot,
       codexParamsByWorkspaceRoot,
+      providerThreadIdByWorkspaceRoot,
       threadIdByWorkspaceRoot,
     });
   }
@@ -274,6 +348,7 @@ function createEmptyState() {
   return {
     bindings: {},
     approvalCommandAllowlistByWorkspaceRoot: {},
+    approvalCommandAutoAllowByWorkspaceRoot: {},
     availableModelCatalog: {
       models: [],
       updatedAt: "",
@@ -283,6 +358,17 @@ function createEmptyState() {
 
 function getThreadMap(binding) {
   return { ...(binding?.threadIdByWorkspaceRoot || {}) };
+}
+
+function getProviderThreadMap(binding) {
+  const raw = binding?.providerThreadIdByWorkspaceRoot || {};
+  const copy = {};
+  for (const [workspaceRoot, providerMap] of Object.entries(raw)) {
+    if (providerMap && typeof providerMap === "object" && !Array.isArray(providerMap)) {
+      copy[workspaceRoot] = { ...providerMap };
+    }
+  }
+  return copy;
 }
 
 function getCodexParamsMap(binding) {
